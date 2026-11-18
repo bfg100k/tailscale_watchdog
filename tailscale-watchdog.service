@@ -1,0 +1,20 @@
+[Unit]
+Description=Tailscale connectivity watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/sbin/tailscale_watchdog --loop
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tailscale-watchdog
+
+[Install]
+WantedBy=multi-user.target
+

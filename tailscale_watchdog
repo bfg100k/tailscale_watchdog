@@ -35,11 +35,21 @@ TW_FLAG_REBOOT=1
 # Consecutive failures before ZeroTier escalation
 TW_MAX_FAIL=3
 
-# Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR
-: "${LOG:=2}"
+# Seconds between completed watchdog checks.
+# The next check starts this many seconds after the previous check finishes.
+TW_INTERVAL=60
 
-# Optional syslog tag
-USE_LOGGER="ts_watchdog"
+# Refresh tag-to-peer IP mappings every N watchdog checks.
+# Direct IP targets are unaffected. The first refresh occurs on startup.
+TW_TAG_CACHE_INTERVAL=10
+
+# Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR
+# INFO is disabled by default to avoid one journal/syslog entry per interval.
+: "${LOG:=3}"
+
+# Leave empty when managed by systemd/procd; they capture stdout/stderr.
+# Set to a syslog tag if direct logger integration is preferred.
+USE_LOGGER=""
 
 
 # --- LOG HELPERS ---
@@ -123,6 +133,18 @@ validate_config() {
         *) _die "LOG must be between 1 and 4." ;;
     esac
 
+    case "$TW_INTERVAL" in
+        ''|*[!0-9]*|0)
+            _die "TW_INTERVAL must be a positive integer (seconds)."
+            ;;
+    esac
+
+    case "$TW_TAG_CACHE_INTERVAL" in
+        ''|*[!0-9]*|0*)
+            _die "TW_TAG_CACHE_INTERVAL must be a positive integer (checks)."
+            ;;
+    esac
+
     if [ -n "$TW_ZT_NETWORK_ID" ]; then
         case "$TW_ZT_NETWORK_ID" in
             *[!a-fA-F0-9]*)
@@ -142,9 +164,54 @@ init_environment() {
     if [ -f /etc/openwrt_release ]; then
         IS_OPENWRT=1
         PERSIST_DIR="/usr/lib/ts_watchdog"
+        TAILSCALE_SERVICE_FN=manage_tailscale_openwrt
+        ZEROTIER_SERVICE_FN=manage_zerotier_openwrt
+        NETWORK_RESTART_FN=restart_network_openwrt
+        if command -v jsonfilter >/dev/null 2>&1; then
+            TAG_IP_PARSER_FN=get_tag_peer_ips_jsonfilter
+        fi
     else
         IS_OPENWRT=0
         PERSIST_DIR="/var/lib/ts_watchdog"
+        TAILSCALE_SERVICE_FN=manage_tailscale_systemd
+        ZEROTIER_SERVICE_FN=manage_zerotier_systemd
+        if command -v systemctl >/dev/null 2>&1; then
+            NETWORK_RESTART_FN=restart_network_systemctl
+        elif command -v ifdown >/dev/null 2>&1 &&
+             command -v ifup >/dev/null 2>&1; then
+            NETWORK_RESTART_FN=restart_network_ifupdown
+        else
+            NETWORK_RESTART_FN=restart_network_unavailable
+        fi
+        if command -v jq >/dev/null 2>&1; then
+            TAG_IP_PARSER_FN=get_tag_peer_ips_jq
+        fi
+    fi
+
+    # Resolve binaries once, rather than searching PATH on every iteration.
+    TAILSCALE_BIN=$(command -v tailscale 2>/dev/null || :)
+    ZEROTIER_BIN=$(command -v zerotier-cli 2>/dev/null || :)
+
+    # Select the interface probe once, rather than checking command
+    # availability on every watchdog iteration.
+    if command -v ip >/dev/null 2>&1; then
+        INTERFACE_CHECK_FN=has_tailscale_interface_ip
+    elif command -v ifconfig >/dev/null 2>&1; then
+        INTERFACE_CHECK_FN=has_tailscale_interface_ifconfig
+    else
+        _die "Neither ip nor ifconfig is available."
+    fi
+
+    # Determine once whether ACL-tag expansion is needed.
+    case " $TW_PING_TARGETS " in
+        *" tag:"*) HAS_TAG_TARGETS=1 ;;
+        *) HAS_TAG_TARGETS=0 ;;
+    esac
+
+    # Validate the JSON parser once if ACL tags are configured.
+    if [ "$HAS_TAG_TARGETS" -eq 1 ]; then
+        [ -n "$TAG_IP_PARSER_FN" ] ||
+            _die "Required Tailscale JSON parser is unavailable."
     fi
 
     VOLATILE_DIR="/tmp/ts_watchdog"
@@ -155,48 +222,76 @@ init_environment() {
     COUNTER_FILE="$VOLATILE_DIR/fail_count"
     WAN_FLAG_FILE="$VOLATILE_DIR/wan_restart_marker"
     STATUS_FILE="$VOLATILE_DIR/tailscale_status.json"
-    PEERS_FILE="$VOLATILE_DIR/tailscale_peers.json"
-    PEER_FILE="$VOLATILE_DIR/tailscale_peer.json"
-
     PERSIST_MARKER="$PERSIST_DIR/reboot_marker"
+
+    # Cache is refreshed on the first check, then every configured interval.
+    TAG_CACHE_AGE=$TW_TAG_CACHE_INTERVAL
+    TAG_IP_CACHE_VALID=0
+    PING_TARGET_CACHE=
 }
 
 
 # --- SERVICE MANAGERS ---
 
+manage_tailscale_openwrt() {
+    /etc/init.d/tailscale "$1"
+}
+
+manage_tailscale_systemd() {
+    systemctl "$1" tailscaled
+}
+
+manage_zerotier_openwrt() {
+    /etc/init.d/zerotier "$1"
+}
+
+manage_zerotier_systemd() {
+    systemctl "$1" zerotier-one
+}
+
+# The selected function names are fixed during initialisation.
 manage_tailscale() {
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        /etc/init.d/tailscale "$1"
-    else
-        systemctl "$1" tailscaled
-    fi
+    "$TAILSCALE_SERVICE_FN" "$1"
 }
 
 manage_zerotier() {
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        /etc/init.d/zerotier "$1"
-    else
-        systemctl "$1" zerotier-one
-    fi
+    "$ZEROTIER_SERVICE_FN" "$1"
 }
 
 
 # --- NETWORK HELPERS ---
 
+has_tailscale_interface_ip() {
+    ip link show tailscale0 >/dev/null 2>&1
+}
+
+has_tailscale_interface_ifconfig() {
+    ifconfig tailscale0 >/dev/null 2>&1
+}
+
 has_tailscale_interface() {
-    if command -v ip >/dev/null 2>&1; then
-        ip link show tailscale0 >/dev/null 2>&1 && return 0
-    fi
-
-    if command -v ifconfig >/dev/null 2>&1; then
-        ifconfig tailscale0 >/dev/null 2>&1 && return 0
-    fi
-
-    return 1
+    "$INTERFACE_CHECK_FN"
 }
 
 is_wan_available() {
     ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1
+}
+
+restart_network_openwrt() {
+    /etc/init.d/network restart
+}
+
+restart_network_systemctl() {
+    systemctl restart networking || systemctl restart NetworkManager
+}
+
+restart_network_ifupdown() {
+    ifdown -a && ifup -a
+}
+
+restart_network_unavailable() {
+    _err "No supported network restart method found."
+    return 1
 }
 
 restart_network() {
@@ -209,51 +304,27 @@ restart_network() {
     touch "$WAN_FLAG_FILE" ||
         _err "Unable to create WAN restart marker."
 
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        /etc/init.d/network restart
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl restart networking ||
-            systemctl restart NetworkManager
-    elif command -v ifdown >/dev/null 2>&1 &&
-         command -v ifup >/dev/null 2>&1; then
-        ifdown -a && ifup -a
-    else
-        _err "No supported network restart method found."
-        return 1
-    fi
+    "$NETWORK_RESTART_FN"
 }
 
 
 # --- TAILSCALE JSON HELPERS ---
 
-# Retrieve Tailscale status JSON once per watchdog execution.
+# Retrieve status once when refreshing the tag cache.
 get_tailscale_status() {
-    if ! tailscale status --json > "$STATUS_FILE" 2>/dev/null; then
-        _err "Unable to retrieve Tailscale status JSON."
-        return 1
-    fi
-
-    return 0
+    "$TAILSCALE_BIN" status --json > "$STATUS_FILE" 2>/dev/null
 }
 
-# Extract IP addresses of peers matching a specific ACL tag.
-#
-# Debian : jq
-# OpenWrt: jsonfilter
-#
-# Output: one IP address per line.
-
-get_tag_peer_ips() {
+# OpenWrt parser.
+get_tag_peer_ips_jsonfilter() {
     tag=$1
 
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        jsonfilter -i "$STATUS_FILE" -e '@.Peer.*' |
+    jsonfilter -i "$STATUS_FILE" -e '@.Peer.*' |
         while IFS= read -r peer; do
             [ -n "$peer" ] || continue
 
             online=$(printf '%s\n' "$peer" |
                 jsonfilter -e '@.Online' 2>/dev/null)
-
             [ "$online" = "true" ] || continue
 
             printf '%s\n' "$peer" |
@@ -263,96 +334,102 @@ get_tag_peer_ips() {
             printf '%s\n' "$peer" |
                 jsonfilter -e '@.TailscaleIPs[*]' 2>/dev/null
         done
-    else
-        jq -r --arg tag "$tag" '
-            (.Peer // {})
-            | .[]
-            | select(.Online == true)
-            | select((.Tags // []) | index($tag))
-            | .TailscaleIPs[]?
-        ' "$STATUS_FILE" 2>/dev/null
+}
+
+# Debian parser.
+get_tag_peer_ips_jq() {
+    jq -r --arg tag "$1" '
+        (.Peer // {})
+        | .[]
+        | select(.Online == true)
+        | select((.Tags // []) | index($tag))
+        | .TailscaleIPs[]?
+    ' "$STATUS_FILE" 2>/dev/null
+}
+
+get_tag_peer_ips() {
+    "$TAG_IP_PARSER_FN" "$1"
+}
+
+# Rebuild the resolved target list atomically in memory. Direct IP targets
+# are copied unchanged; tag targets are expanded from one status snapshot.
+# If status retrieval fails, retain the previous cache when one exists.
+refresh_ping_target_cache() {
+    new_cache=
+    has_tag_targets=0
+
+    for configured_target in $TW_PING_TARGETS; do
+        case "$configured_target" in
+            tag:*) has_tag_targets=1 ;;
+            *) new_cache="$new_cache $configured_target" ;;
+        esac
+    done
+
+    if [ "$has_tag_targets" -eq 1 ]; then
+        if ! get_tailscale_status; then
+            _err "Unable to refresh Tailscale tag peer cache."
+            [ "$TAG_IP_CACHE_VALID" -eq 1 ] && return 0
+            PING_TARGET_CACHE=$new_cache
+            return 1
+        fi
+
+        for configured_target in $TW_PING_TARGETS; do
+            case "$configured_target" in
+                tag:*)
+                    tag_ips=$(get_tag_peer_ips "$configured_target") || tag_ips=
+                    if [ -z "$tag_ips" ]; then
+                        _debug "No online Tailscale peers found for tag: $configured_target"
+                    else
+                        for cached_ip in $tag_ips; do
+                            new_cache="$new_cache $cached_ip"
+                        done
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    # Strip leading whitespace and publish the complete new cache.
+    PING_TARGET_CACHE=${new_cache# }
+    TAG_IP_CACHE_VALID=1
+    _debug "Tailscale target cache refreshed."
+    return 0
+}
+
+refresh_ping_target_cache_if_due() {
+    [ "$HAS_TAG_TARGETS" -eq 1 ] || return 0
+
+    if [ "$TAG_CACHE_AGE" -ge "$TW_TAG_CACHE_INTERVAL" ]; then
+        refresh_ping_target_cache || :
+        TAG_CACHE_AGE=0
     fi
 }
 
 # --- TAILSCALE CHECKS ---
 
 check_tailscale_targets() {
-    if ! command -v tailscale >/dev/null 2>&1; then
+    if [ -z "$TAILSCALE_BIN" ]; then
         _err "Tailscale CLI unavailable."
         return 1
     fi
 
-    # Determine whether JSON parsing is required.
-    NEED_JSON=0
+    refresh_ping_target_cache_if_due
 
-    for target in $TW_PING_TARGETS; do
-        case "$target" in
-            tag:*) NEED_JSON=1 ;;
-        esac
-    done
+    for target in $PING_TARGET_CACHE; do
+        _debug "Checking Tailscale target: $target"
 
-    if [ "$NEED_JSON" -eq 1 ]; then
-
-        if [ "$IS_OPENWRT" -eq 1 ]; then
-            command -v jsonfilter >/dev/null 2>&1 ||
-                _die "jsonfilter is required on OpenWrt."
-        else
-            command -v jq >/dev/null 2>&1 ||
-                _die "jq is required on Debian."
+        if "$TAILSCALE_BIN" ping --c=1 --timeout=5s "$target" >/dev/null 2>&1; then
+            _info "Tailscale target reachable: $target"
+            return 0
         fi
-
-        get_tailscale_status || return 1
-    fi
-
-    # Iterate through configured targets.
-    for target in $TW_PING_TARGETS; do
-
-        case "$target" in
-            tag:*)
-
-                _debug "Resolving Tailscale ACL tag: $target"
-
-                tag_ips=$(get_tag_peer_ips "$target")
-
-                if [ -z "$tag_ips" ]; then
-                    _warn "No Tailscale peers found for tag: $target"
-                    continue
-                fi
-
-                for ip_address in $tag_ips; do
-                    _debug "Checking tagged peer: $target ($ip_address)"
-
-                    if tailscale ping --c=1 --timeout=5s \
-                        "$ip_address" >/dev/null 2>&1; then
-
-                        _info "Tailscale target reachable: $target ($ip_address)"
-                        return 0
-                    fi
-
-                    _debug "Tagged peer unreachable: $ip_address"
-                done
-                ;;
-
-            *)
-                # Direct IP address target.
-                _debug "Checking Tailscale IP: $target"
-
-                if tailscale ping --c=1 --timeout=5s \
-                    "$target" >/dev/null 2>&1; then
-
-                    _info "Tailscale target reachable: $target"
-                    return 0
-                fi
-                ;;
-        esac
     done
 
-    _warn "None of the configured Tailscale targets are reachable."
+    _warn "None of the cached Tailscale targets are reachable."
     return 1
 }
 
 check_tailscale_status() {
-    if ! tailscale status >/dev/null 2>&1; then
+    if [ -z "$TAILSCALE_BIN" ] || ! "$TAILSCALE_BIN" status >/dev/null 2>&1; then
         _warn "Tailscale daemon status check failed."
         return 1
     fi
@@ -366,7 +443,7 @@ check_tailscale_status() {
 
 # Get status of the configured ZeroTier network.
 get_zerotier_network_status() {
-    zerotier-cli listnetworks 2>/dev/null |
+    "$ZEROTIER_BIN" listnetworks 2>/dev/null |
         awk -v nwid="$TW_ZT_NETWORK_ID" '
             $1 == "200" && $2 == "listnetworks" && $3 == nwid {
                 print $6
@@ -389,7 +466,7 @@ activate_zerotier() {
         return 1
     fi
 
-    if ! command -v zerotier-cli >/dev/null 2>&1; then
+    if [ -z "$ZEROTIER_BIN" ]; then
         _err "zerotier-cli unavailable."
         return 1
     fi
@@ -412,7 +489,7 @@ activate_zerotier() {
     if [ -z "$ZT_STATUS" ]; then
         _info "Joining ZeroTier network: $TW_ZT_NETWORK_ID"
 
-        if ! zerotier-cli join "$TW_ZT_NETWORK_ID"; then
+        if ! "$ZEROTIER_BIN" join "$TW_ZT_NETWORK_ID"; then
             _err "Unable to join ZeroTier network."
             return 1
         fi
@@ -457,6 +534,7 @@ save_fail_count() {
 }
 
 reset_fail_count() {
+    FAIL_COUNT=0
     rm -f "$COUNTER_FILE" "$PERSIST_MARKER"
     _info "Tailscale recovered. Failure counter and reboot marker cleared."
 }
@@ -521,11 +599,6 @@ remediate_failure() {
 # --- MAIN WATCHDOG LOGIC ---
 
 main() {
-    _quit_if_no_root_privileges
-    validate_config
-    init_environment
-    load_fail_count
-
     _info "Executing Tailscale watchdog checks..."
 
     TS_FAILED=0
@@ -572,5 +645,53 @@ main() {
     remediate_failure
 }
 
-main "$@"
+# --- PROCESS LIFECYCLE ---
+
+startup() {
+    _quit_if_no_root_privileges
+    validate_config
+    init_environment
+    load_fail_count
+}
+
+run_loop() {
+    # Run in the foreground. systemd/procd supervise this process directly.
+    # A failed health check is not a process failure; main() reports it and
+    # the next check runs after TW_INTERVAL seconds.
+    trap 'exit 0' HUP INT TERM
+
+    while :; do
+        main || :
+        TAG_CACHE_AGE=$((TAG_CACHE_AGE + HAS_TAG_TARGETS))
+        sleep "$TW_INTERVAL" ||
+            _die "Unable to sleep for TW_INTERVAL=$TW_INTERVAL seconds."
+    done
+}
+
+case "${1:-}" in
+    --once)
+        startup
+        main
+        ;;
+    --loop|'')
+        startup
+        run_loop
+        ;;
+    --help|-h)
+        cat <<EOF
+Usage: $0 [--loop|--once|--help]
+  --loop  Run continuously (default); intended for systemd/procd.
+  --once  Run one health check and exit.
+  --help  Show this help.
+
+TW_INTERVAL=$TW_INTERVAL seconds between completed checks.
+TW_TAG_CACHE_INTERVAL=$TW_TAG_CACHE_INTERVAL checks between tag cache refreshes.
+EOF
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        echo "Usage: $0 [--loop|--once|--help]" >&2
+        exit 2
+        ;;
+esac
 
