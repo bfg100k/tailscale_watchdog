@@ -19,29 +19,20 @@
 #   - Reset failure counter when Tailscale recovers.
 # ==============================================================================
 
-# --- USER CONFIGURATION ---
+# --- CONFIGURATION ---
 
-# Space-separated Tailnet IPs and/or Tailscale ACL tags
-# Tags must use the tag: prefix.
-# ANY one reachable target is sufficient.
-TW_PING_TARGETS="100.64.0.1 tag:server tag:router"
+# Configuration is kept outside the executable so package/script updates do
+# not overwrite local settings. The file is shell syntax and must be trusted.
+CONFIG_FILE="/etc/tailscale_watchdog.conf"
 
-# ZeroTier network ID (blank to disable fallback)
-TW_ZT_NETWORK_ID="abcdef0123456789"
-
-# Reboot if enabled (1 = enabled, 0 = disabled)
-TW_FLAG_REBOOT=1
-
-# Consecutive failures before ZeroTier escalation
-TW_MAX_FAIL=3
-
-# Seconds between completed watchdog checks.
-# The next check starts this many seconds after the previous check finishes.
-TW_INTERVAL=60
-
-# Refresh tag-to-peer IP mappings every N watchdog checks.
-# Direct IP targets are unaffected. The first refresh occurs on startup.
+# Defaults (overridden by CONFIG_FILE when it exists).
+TW_PING_TARGETS=""
+TW_ZT_NETWORK_ID=""
+TW_FAIL_REBOOT=""
+TW_FAIL_START_ZT=""
+TW_CHECK_INTERVAL=60
 TW_TAG_CACHE_INTERVAL=10
+TW_DISCORD_WEBHOOK=""
 
 # Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR
 # INFO is disabled by default to avoid one journal/syslog entry per interval.
@@ -51,6 +42,12 @@ TW_TAG_CACHE_INTERVAL=10
 # Set to a syslog tag if direct logger integration is preferred.
 USE_LOGGER=""
 
+if [ -r "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE" || {
+        echo "FATAL ERROR: Unable to load $CONFIG_FILE." >&2
+        exit 1
+    }
+fi
 
 # --- LOG HELPERS ---
 
@@ -112,30 +109,71 @@ _quit_if_no_root_privileges() {
     fi
 }
 
-validate_config() {
-    case "$TW_MAX_FAIL" in
-        ''|*[!0-9]*|0*)
-            _die "TW_MAX_FAIL must be a positive integer."
-            ;;
+# Validate an optional signed decimal integer and normalise leading zeroes.
+# The supported range is deliberately bounded to avoid shell arithmetic
+# overflow on embedded systems.
+_normalize_threshold() {
+    threshold_value=$1
+
+    case "$threshold_value" in
+        '') NORMALIZED_THRESHOLD=0; return 0 ;;
+        -*) threshold_sign=-; threshold_digits=${threshold_value#-} ;;
+        +*) threshold_sign=; threshold_digits=${threshold_value#+} ;;
+        *) threshold_sign=; threshold_digits=$threshold_value ;;
     esac
 
-    if [ "$TW_MAX_FAIL" -lt 3 ]; then
-        _die "TW_MAX_FAIL must be at least 3."
+    case "$threshold_digits" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+
+    [ "${#threshold_digits}" -le 9 ] || return 1
+
+    while [ "${threshold_digits#0}" != "$threshold_digits" ]; do
+        threshold_digits=${threshold_digits#0}
+    done
+    [ -n "$threshold_digits" ] || threshold_digits=0
+
+    NORMALIZED_THRESHOLD="${threshold_sign}${threshold_digits}"
+    [ "$NORMALIZED_THRESHOLD" != "-0" ] || NORMALIZED_THRESHOLD=0
+    return 0
+}
+
+validate_config() {
+    _normalize_threshold "$TW_FAIL_REBOOT" ||
+        _die "TW_FAIL_REBOOT must be an optional signed integer (maximum 9 digits)."
+    REBOOT_THRESHOLD=$NORMALIZED_THRESHOLD
+
+    _normalize_threshold "$TW_FAIL_START_ZT" ||
+        _die "TW_FAIL_START_ZT must be an optional signed integer (maximum 9 digits)."
+    ZT_THRESHOLD=$NORMALIZED_THRESHOLD
+
+    if [ "$REBOOT_THRESHOLD" -gt 0 ] && [ "$ZT_THRESHOLD" -gt 0 ] &&
+       [ "$ZT_THRESHOLD" -le "$REBOOT_THRESHOLD" ]; then
+        _die "TW_FAIL_START_ZT must be greater than TW_FAIL_REBOOT when both are enabled."
     fi
 
-    case "$TW_FLAG_REBOOT" in
-        0|1) ;;
-        *) _die "TW_FLAG_REBOOT must be 0 or 1." ;;
-    esac
+    if [ "$ZT_THRESHOLD" -gt 0 ]; then
+        if [ -z "$TW_ZT_NETWORK_ID" ]; then
+            _die "TW_ZT_NETWORK_ID is required when TW_FAIL_START_ZT is enabled."
+        fi
+
+        case "$TW_ZT_NETWORK_ID" in
+            *[!a-fA-F0-9]*) _die "Invalid ZeroTier network ID." ;;
+        esac
+
+        if [ "${#TW_ZT_NETWORK_ID}" -ne 16 ]; then
+            _die "ZeroTier network ID must contain 16 hexadecimal characters."
+        fi
+    fi
 
     case "$LOG" in
         1|2|3|4) ;;
         *) _die "LOG must be between 1 and 4." ;;
     esac
 
-    case "$TW_INTERVAL" in
+    case "$TW_CHECK_INTERVAL" in
         ''|*[!0-9]*|0)
-            _die "TW_INTERVAL must be a positive integer (seconds)."
+            _die "TW_CHECK_INTERVAL must be a positive integer (seconds)."
             ;;
     esac
 
@@ -144,18 +182,6 @@ validate_config() {
             _die "TW_TAG_CACHE_INTERVAL must be a positive integer (checks)."
             ;;
     esac
-
-    if [ -n "$TW_ZT_NETWORK_ID" ]; then
-        case "$TW_ZT_NETWORK_ID" in
-            *[!a-fA-F0-9]*)
-                _die "Invalid ZeroTier network ID."
-                ;;
-        esac
-
-        if [ "${#TW_ZT_NETWORK_ID}" -ne 16 ]; then
-            _die "ZeroTier network ID must contain 16 hexadecimal characters."
-        fi
-    fi
 }
 
 init_environment() {
@@ -540,58 +566,106 @@ reset_fail_count() {
 }
 
 
-# --- REMEDIATION ---
+# --- DISCORD NOTIFICATIONS ---
 
-remediate_failure() {
+# Notifications are best-effort: a missing curl binary, network error, or
+# rejected webhook must never prevent the remediation action itself.
+discord_notify() {
+    [ -n "$TW_DISCORD_WEBHOOK" ] || return 0
 
-    # Persistent marker means reboot was already attempted.
-    if [ -f "$PERSIST_MARKER" ]; then
-        _warn "Post-reboot failure detected. Skipping further reboot attempts."
-        rm -f "$PERSIST_MARKER"
-        FAIL_COUNT=$TW_MAX_FAIL
-    else
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-    fi
-
-    save_fail_count
-
-    _warn "Consecutive Tailscale failures: $FAIL_COUNT / $TW_MAX_FAIL"
-
-    # STEP 1: Restart Tailscale.
-    if [ "$FAIL_COUNT" -eq 1 ]; then
-        _warn "Escalation 1: Restarting Tailscale daemon."
-
-        if ! manage_tailscale restart; then
-            _err "Tailscale daemon restart failed."
-            return 1
-        fi
-
+    if ! command -v curl >/dev/null 2>&1; then
+        _warn "Discord notification skipped: curl is unavailable."
         return 0
     fi
 
-    # STEP 2: Reboot once (optional).
-    if [ "$FAIL_COUNT" -eq 2 ] && [ "$TW_FLAG_REBOOT" -eq 1 ]; then
-        _warn "Escalation 2: Preparing system reboot."
+    # Messages generated by this script are single-line. Escape JSON string
+    # characters before constructing the request body.
+    discord_json_message=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    discord_payload="{\"content\":\"$discord_json_message\"}"
+
+    discord_output=$(curl -fsS --connect-timeout 5 --max-time 10 \
+        -H 'Content-Type: application/json' \
+        --data-binary "$discord_payload" \
+        "$TW_DISCORD_WEBHOOK" 2>&1)
+    discord_status=$?
+
+    if [ "$discord_status" -ne 0 ]; then
+        _warn "Discord notification failed (curl exit $discord_status): $discord_output"
+    fi
+
+    return 0
+}
+
+
+# --- REMEDIATION ---
+
+remediate_failure() {
+    # The persistent marker survives reboot while COUNTER_FILE does not.
+    # Restore the count at which reboot was attempted, then count this failed
+    # post-reboot check as the next consecutive failure.
+    if [ -f "$PERSIST_MARKER" ]; then
+        if [ "$REBOOT_THRESHOLD" -gt 0 ]; then
+            stored_reboot_threshold=$(cat "$PERSIST_MARKER" 2>/dev/null)
+            case "$stored_reboot_threshold" in
+                ''|*[!0-9]*)
+                    _warn "Invalid reboot marker. Continuing with the volatile failure counter."
+                    ;;
+                *)
+                    FAIL_COUNT=$stored_reboot_threshold
+                    ;;
+            esac
+        fi
+        rm -f "$PERSIST_MARKER"
+    fi
+
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    save_fail_count
+
+    _warn "Consecutive Tailscale failures: $FAIL_COUNT"
+
+    # Once ZeroTier escalation has been reached, do not repeat activation or
+    # take any further remediation action until Tailscale recovers.
+    if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ]; then
+        _warn "Tailscale remains unhealthy after ZeroTier escalation. No further remediation will be attempted."
+        return 0
+    fi
+
+    # Start ZeroTier exactly at its configured threshold. This is checked
+    # before reboot only because validation requires ZT_THRESHOLD > REBOOT_THRESHOLD.
+    if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -eq "$ZT_THRESHOLD" ]; then
+        _warn "Escalation: Activating ZeroTier fallback."
+        discord_notify "Tailscale watchdog: activating ZeroTier fallback after $FAIL_COUNT consecutive failed checks."
+        activate_zerotier
+        return $?
+    fi
+
+    # Reboot exactly once at the configured threshold. The marker prevents a
+    # second reboot after startup, including when the reboot command fails.
+    if [ "$REBOOT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -eq "$REBOOT_THRESHOLD" ]; then
+        _warn "Escalation: Rebooting system after $FAIL_COUNT consecutive failed checks."
+        discord_notify "Tailscale watchdog: rebooting after $FAIL_COUNT consecutive failed checks."
 
         mkdir -p "$PERSIST_DIR" ||
             _die "Unable to create persistent directory."
 
-        touch "$PERSIST_MARKER" ||
-            _die "Unable to create reboot marker."
+        printf '%s\n' "$REBOOT_THRESHOLD" > "$PERSIST_MARKER" ||
+            _die "Unable to write reboot marker."
 
         sync
         reboot
         return $?
     fi
 
-    # STEP 3: Activate ZeroTier.
-    if [ "$FAIL_COUNT" -ge "$TW_MAX_FAIL" ]; then
-        _warn "Escalation 3: Activating ZeroTier fallback."
-        activate_zerotier
-        return $?
+    # Before escalation thresholds (and indefinitely when both are disabled),
+    # restart Tailscale on every failed check.
+    _warn "Restarting Tailscale daemon."
+    discord_notify "Tailscale watchdog: restarting tailscaled after $FAIL_COUNT consecutive failed checks."
+
+    if ! manage_tailscale restart; then
+        _err "Tailscale daemon restart failed."
+        return 1
     fi
 
-    _info "Waiting for next watchdog execution."
     return 0
 }
 
@@ -657,14 +731,14 @@ startup() {
 run_loop() {
     # Run in the foreground. systemd/procd supervise this process directly.
     # A failed health check is not a process failure; main() reports it and
-    # the next check runs after TW_INTERVAL seconds.
+    # the next check runs after TW_CHECK_INTERVAL seconds.
     trap 'exit 0' HUP INT TERM
 
     while :; do
         main || :
         TAG_CACHE_AGE=$((TAG_CACHE_AGE + HAS_TAG_TARGETS))
-        sleep "$TW_INTERVAL" ||
-            _die "Unable to sleep for TW_INTERVAL=$TW_INTERVAL seconds."
+        sleep "$TW_CHECK_INTERVAL" ||
+            _die "Unable to sleep for TW_CHECK_INTERVAL=$TW_CHECK_INTERVAL seconds."
     done
 }
 
@@ -684,7 +758,8 @@ Usage: $0 [--loop|--once|--help]
   --once  Run one health check and exit.
   --help  Show this help.
 
-TW_INTERVAL=$TW_INTERVAL seconds between completed checks.
+Configuration file: $CONFIG_FILE
+TW_CHECK_INTERVAL=$TW_CHECK_INTERVAL seconds between completed checks.
 TW_TAG_CACHE_INTERVAL=$TW_TAG_CACHE_INTERVAL checks between tag cache refreshes.
 EOF
         ;;

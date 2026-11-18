@@ -1,7 +1,8 @@
 [Unit]
 Description=Tailscale connectivity watchdog
 Wants=network-online.target
-After=network-online.target
+Requires=tailscaled.service
+After=network-online.target tailscaled.service
 
 [Service]
 Type=simple
@@ -17,4 +18,3 @@ SyslogIdentifier=tailscale-watchdog
 
 [Install]
 WantedBy=multi-user.target
-

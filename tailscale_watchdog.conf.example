@@ -1,0 +1,31 @@
+# Copy to /etc/tailscale_watchdog.conf and edit for your environment.
+# This file is sourced as POSIX shell; use valid shell assignments.
+
+# Space-separated Tailnet IPs and/or Tailscale ACL tags.
+# Any one reachable target is sufficient. Leave empty to check daemon status.
+TW_PING_TARGETS="100.64.0.1 tag:server tag:router"
+
+# Optional ZeroTier fallback. Required when TW_FAIL_START_ZT is positive.
+# Replace this example with your actual 16-character network ID.
+TW_ZT_NETWORK_ID="abcdef0123456789"
+
+# Reboot once after this many consecutive failed checks.
+# Empty, zero, or a negative value disables reboot escalation.
+TW_FAIL_REBOOT=3
+
+# Start ZeroTier after this many consecutive failed checks.
+# Must be greater than TW_FAIL_REBOOT when both are enabled.
+# Empty, zero, or a negative value disables ZeroTier escalation.
+TW_FAIL_START_ZT=4
+
+# Seconds between completed watchdog checks.
+TW_CHECK_INTERVAL=60
+
+# Refresh tag-to-peer IP mappings every N watchdog checks.
+TW_TAG_CACHE_INTERVAL=10
+
+# Optional Discord webhook URL. Leave empty to disable notifications.
+TW_DISCORD_WEBHOOK=""
+
+# Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR.
+LOG=3
