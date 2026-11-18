@@ -2,96 +2,168 @@
 # ==============================================================================
 # Tailscale Watchdog
 # ==============================================================================
-# Platforms: Debian & OpenWrt (Dash / BusyBox Ash Compliant)
-# Checks: TS Interface / Ping Tailscale Targets or check Tailscale service status
-# Remediation 
-#   Escalation : Restart Daemon -> System Reboot (optional) -> Activate ZeroTier (optional)
-#   Exception  : Don't remediate if internet connection is not available.
-#   Robustness : Only start each remediation after X consecutive failures
+# Platforms: Debian / OpenWrt (POSIX sh / BusyBox ash)
+#
+# Checks:
+#   - Tailscale interface
+#   - Tailscale data-plane connectivity OR daemon status
+#
+# Remediation:
+#   1. Restart Tailscale daemon
+#   2. Reboot once (optional)
+#   3. Activate ZeroTier fallback (optional)
+#
+# Exceptions:
+#   - Do not increment failure counter when WAN is unavailable.
+#   - Restart network stack only once per WAN outage.
+#   - Reset failure counter when Tailscale recovers.
 # ==============================================================================
 
 # --- USER CONFIGURATION ---
-# Space-separated Tailnet targets using Tailnet IPs
-# alternatively, specify one or more tailscale tag names to use those nodes as targets
-TW_PING_TARGETS="100.64.0.1 100.64.0.2 100.64.0.3" 
-#TW_PING_TARGETS="subnet-router"
-# start ZT if set
+
+# Space-separated Tailnet IPs and/or Tailscale ACL tags
+# Tags must use the tag: prefix.
+# ANY one reachable target is sufficient.
+TW_PING_TARGETS="100.64.0.1 tag:server tag:router"
+
+# ZeroTier network ID (blank to disable fallback)
 TW_ZT_NETWORK_ID="abcdef0123456789"
-# reboot if flag is set
+
+# Reboot if enabled (1 = enabled, 0 = disabled)
 TW_FLAG_REBOOT=1
-# remediate and escalate after this number of consecutive failures each time
+
+# Consecutive failures before ZeroTier escalation
 TW_MAX_FAIL=3
 
+# Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR
+: "${LOG:=2}"
+
+# Optional syslog tag
+USE_LOGGER="ts_watchdog"
+
+
 # --- LOG HELPERS ---
-# Log levels = 1 - DEBUG, 2 - INFO, 3 - WARN, 4 - ERROR
-# default is INFO if not set
-# FATAL errors will always be logged regardless of the log level.
-: ${LOG:=2}
 
 _die() {
-  echo "FATAL ERROR: $1" >&2 && \
-  [[ -n "$USE_LOGGER" ]] && logger -t "$USE_LOGGER" "FATAL ERROR: $1"
-  exit 1
+    echo "FATAL ERROR: $1" >&2
+    if [ -n "$USE_LOGGER" ]; then
+        logger -t "$USE_LOGGER" "FATAL ERROR: $1"
+    fi
+    exit 1
 }
 
 _err() {
-  [ "$LOG" -le 4 ] && echo "ERROR: $1" >&2 && \
-  [ -n "$USE_LOGGER" ] && logger -t "$USE_LOGGER" "ERROR: $1"
-  return 0
+    if [ "$LOG" -le 4 ]; then
+        echo "ERROR: $1" >&2
+        [ -n "$USE_LOGGER" ] &&
+            logger -t "$USE_LOGGER" "ERROR: $1"
+    fi
+    return 0
 }
 
 _warn() {
-  [ "$LOG" -le 3 ] && echo "WARN: $1" && \
-  [ -n "$USE_LOGGER" ] && logger -t "$USE_LOGGER" "WARN: $1"
-  return 0
+    if [ "$LOG" -le 3 ]; then
+        echo "WARN: $1"
+        [ -n "$USE_LOGGER" ] &&
+            logger -t "$USE_LOGGER" "WARN: $1"
+    fi
+    return 0
 }
 
 _info() {
-  [ "$LOG" -le 2 ] && echo "INFO: $1" && \
-  [ -n "$USE_LOGGER" ] && logger -t "$USE_LOGGER" "INFO: $1"
-  return 0
+    if [ "$LOG" -le 2 ]; then
+        echo "INFO: $1"
+        [ -n "$USE_LOGGER" ] &&
+            logger -t "$USE_LOGGER" "INFO: $1"
+    fi
+    return 0
 }
 
 _debug() {
-  [ "$LOG" -le 1 ] && echo "DEBUG: $1" && \
-    [ -n "$USE_LOGGER" ] && logger -t "$USE_LOGGER" "DEBUG: $1"
-  return 0
+    if [ "$LOG" -le 1 ]; then
+        echo "DEBUG: $1"
+        [ -n "$USE_LOGGER" ] &&
+            logger -t "$USE_LOGGER" "DEBUG: $1"
+    fi
+    return 0
 }
 
 _quit() {
-  _info "$1"
-  exit 0
+    _info "$1"
+    exit 0
 }
 
-# --- INITIALISATION HELPERS ---
+
+# --- INITIALISATION ---
+
 _quit_if_no_root_privileges() {
-  [ -w / ] && return 0
-  _die "This script requires root privileges. Please run it with sudo or as the root user."
+    if [ "$(id -u)" -ne 0 ]; then
+        _die "This script requires root privileges."
+    fi
 }
 
-env_var_checks {
-  # mandatory variables
-  : ${DISK_MONITOR_DISCORD_WEBHOOK:?} #CANNOT BE BLANK! PLEASE PROVIDE IN CONFIG FILE
-  # optional variables with defaults
-  : ${DISK_MONITOR_WARN_LEVEL:="90"} #default to 90% if not set
-  : ${DISK_MONITOR_ALERT_LEVEL:="95"} #default to 95% if not set
+validate_config() {
+    case "$TW_MAX_FAIL" in
+        ''|*[!0-9]*|0*)
+            _die "TW_MAX_FAIL must be a positive integer."
+            ;;
+    esac
+
+    if [ "$TW_MAX_FAIL" -lt 3 ]; then
+        _die "TW_MAX_FAIL must be at least 3."
+    fi
+
+    case "$TW_FLAG_REBOOT" in
+        0|1) ;;
+        *) _die "TW_FLAG_REBOOT must be 0 or 1." ;;
+    esac
+
+    case "$LOG" in
+        1|2|3|4) ;;
+        *) _die "LOG must be between 1 and 4." ;;
+    esac
+
+    if [ -n "$TW_ZT_NETWORK_ID" ]; then
+        case "$TW_ZT_NETWORK_ID" in
+            *[!a-fA-F0-9]*)
+                _die "Invalid ZeroTier network ID."
+                ;;
+        esac
+
+        if [ "${#TW_ZT_NETWORK_ID}" -ne 16 ]; then
+            _die "ZeroTier network ID must contain 16 hexadecimal characters."
+        fi
+    fi
 }
 
 init_environment() {
-    mkdir -p "$VOLATILE_DIR"
-    
-    if [ -f "/etc/openwrt_release" ]; then
+    umask 077
+
+    if [ -f /etc/openwrt_release ]; then
         IS_OPENWRT=1
-        PERSIST_DIR="/usr/lib/ts_watchdog" # Flash rootfs
+        PERSIST_DIR="/usr/lib/ts_watchdog"
     else
         IS_OPENWRT=0
-        PERSIST_DIR="/var/lib/ts_watchdog"  # Standard disk storage
+        PERSIST_DIR="/var/lib/ts_watchdog"
     fi
-    
+
+    VOLATILE_DIR="/tmp/ts_watchdog"
+
+    mkdir -p "$VOLATILE_DIR" ||
+        _die "Unable to create volatile directory."
+
+    COUNTER_FILE="$VOLATILE_DIR/fail_count"
+    WAN_FLAG_FILE="$VOLATILE_DIR/wan_restart_marker"
+    STATUS_FILE="$VOLATILE_DIR/tailscale_status.json"
+    PEERS_FILE="$VOLATILE_DIR/tailscale_peers.json"
+    PEER_FILE="$VOLATILE_DIR/tailscale_peer.json"
+
     PERSIST_MARKER="$PERSIST_DIR/reboot_marker"
 }
 
+
 # --- SERVICE MANAGERS ---
+
 manage_tailscale() {
     if [ "$IS_OPENWRT" -eq 1 ]; then
         /etc/init.d/tailscale "$1"
@@ -108,106 +180,397 @@ manage_zerotier() {
     fi
 }
 
-restart_network() {
-    if [ -f "$WAN_FLAG_FILE" ]; then
-        _warn "WAN is down, but network stack was already cycled. Standing down to prevent flapping."
-        return 0
+
+# --- NETWORK HELPERS ---
+
+has_tailscale_interface() {
+    if command -v ip >/dev/null 2>&1; then
+        ip link show tailscale0 >/dev/null 2>&1 && return 0
     fi
 
-    _warn "WAN drop detected for the first time. Bouncing network interfaces..."
-    touch "$WAN_FLAG_FILE"
-
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        /etc/init.d/network restart
-    else
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl restart networking || systemctl restart NetworkManager
-        else
-            ifdown -a && ifup -a
-        fi
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig tailscale0 >/dev/null 2>&1 && return 0
     fi
-}
 
-is_zerotier_running() {
-    if ip link show | grep -q "zt" >/dev/null 2>&1 || ifconfig -a | grep -q "zt" >/dev/null 2>&1; then
-        return 0
-    fi
     return 1
 }
 
-# --- MAIN WATCHDOG LOGIC ---
-main() {
-    init_environment
+is_wan_available() {
+    ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1
+}
 
-    FAIL_COUNT=0
-    if [ -f "$COUNTER_FILE" ]; then
-        FAIL_COUNT=$(cat "$COUNTER_FILE")
+restart_network() {
+    if [ -f "$WAN_FLAG_FILE" ]; then
+        _warn "WAN is down. Network stack was already restarted. Standing by."
+        return 0
     fi
 
-    _info "Executing Checks..."
+    _warn "WAN unavailable. Restarting network stack..."
+    touch "$WAN_FLAG_FILE" ||
+        _err "Unable to create WAN restart marker."
 
-    # Check 1: Check tailscale interface
-    if ! ip link show tailscale0 >/dev/null 2>&1 && ! ifconfig tailscale0 >/dev/null 2>&1; then
-        _warn "Check 1 failed: tailscale0 interface does not exist in kernel. Restarting tailscale daemon to fix issue."
-        manage_tailscale restart
+    if [ "$IS_OPENWRT" -eq 1 ]; then
+        /etc/init.d/network restart
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl restart networking ||
+            systemctl restart NetworkManager
+    elif command -v ifdown >/dev/null 2>&1 &&
+         command -v ifup >/dev/null 2>&1; then
+        ifdown -a && ifup -a
+    else
+        _err "No supported network restart method found."
         return 1
-    fi
-    _info "Check 1 - Tailscale interface OK"
-
-    if [ -n "$PING_TARGETS" ]; then
-      # Check 2a: Data Plane Verification using Ping targets if set
-    else
-      # Check 2b: check tailscale daemon status if not pinging targets
-    fi      
-
-    # Checks failed: start remediation
-    if ! ping -c 2 -w 3 1.1.1.1 >/dev/null 2>&1; then
-        echo "Failure Isolated: Public Internet WAN is down."
-        restart_network
-        exit 1
-    fi
-
-    # Clear stale WAN flag since internet is up
-    rm -f "$WAN_FLAG_FILE"
-
-    # CRITICAL EVALUATION: Check if we just freshly booted up from a watchdog reboot
-    if [ -f "$PERSIST_MARKER" ]; then
-        echo "Detected post-reboot state. Tailscale remains broken."
-        mkdir -p "$PERSIST_DIR"
-        rm -f "$PERSIST_MARKER" # Delete marker immediately to stop flash wear
-        FAIL_COUNT=$MAX_FAILS    # Fast-forward directly to ZeroTier fallback
-    else
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-    fi
-    
-    echo "$FAIL_COUNT" > "$COUNTER_FILE"
-    echo "Consecutive Tailscale tunnel failures: $FAIL_COUNT / $MAX_FAILS"
-
-    # STEP 4: Escalation Matrix
-    if [ "$FAIL_COUNT" -eq 1 ]; then
-        echo "Escalation Step 1: Restarting Tailscale Daemon..."
-        manage_tailscale restart
-
-    elif [ "$FAIL_COUNT" -eq 2 ]; then
-        echo "Escalation Step 2: Persistent failure. Creating flash marker and triggering reboot..."
-        mkdir -p "$PERSIST_DIR"
-        touch "$PERSIST_MARKER" # The ONLY persistent disk write in the entire fault loop
-        sync
-        reboot
-        exit 0
-
-    elif [ "$FAIL_COUNT" -ge "$MAX_FAILS" ]; then
-        if is_zerotier_running; then
-            echo "Notice: Tailscale is still down, but ZeroTier backup tunnel is verified UP. Standing by."
-            exit 0
-        fi
-
-        echo "Escalation Step 3 (LAST RESORT): ZeroTier interface missing. Deploying backup tunnel..."
-        manage_zerotier start
-        if command -v zerotier-cli >/dev/null 2>&1; then
-            zerotier-cli join "$ZT_NETWORK_ID"
-        fi
     fi
 }
 
+
+# --- TAILSCALE JSON HELPERS ---
+
+# Retrieve Tailscale status JSON once per watchdog execution.
+get_tailscale_status() {
+    if ! tailscale status --json > "$STATUS_FILE" 2>/dev/null; then
+        _err "Unable to retrieve Tailscale status JSON."
+        return 1
+    fi
+
+    return 0
+}
+
+# Extract IP addresses of peers matching a specific ACL tag.
+#
+# Debian : jq
+# OpenWrt: jsonfilter
+#
+# Output: one IP address per line.
+
+get_tag_peer_ips() {
+    tag=$1
+
+    if [ "$IS_OPENWRT" -eq 1 ]; then
+        jsonfilter -i "$STATUS_FILE" -e '@.Peer.*' |
+        while IFS= read -r peer; do
+            [ -n "$peer" ] || continue
+
+            online=$(printf '%s\n' "$peer" |
+                jsonfilter -e '@.Online' 2>/dev/null)
+
+            [ "$online" = "true" ] || continue
+
+            printf '%s\n' "$peer" |
+                jsonfilter -e '@.Tags[*]' 2>/dev/null |
+                grep -F -x "$tag" >/dev/null 2>&1 || continue
+
+            printf '%s\n' "$peer" |
+                jsonfilter -e '@.TailscaleIPs[*]' 2>/dev/null
+        done
+    else
+        jq -r --arg tag "$tag" '
+            (.Peer // {})
+            | .[]
+            | select(.Online == true)
+            | select((.Tags // []) | index($tag))
+            | .TailscaleIPs[]?
+        ' "$STATUS_FILE" 2>/dev/null
+    fi
+}
+
+# --- TAILSCALE CHECKS ---
+
+check_tailscale_targets() {
+    if ! command -v tailscale >/dev/null 2>&1; then
+        _err "Tailscale CLI unavailable."
+        return 1
+    fi
+
+    # Determine whether JSON parsing is required.
+    NEED_JSON=0
+
+    for target in $TW_PING_TARGETS; do
+        case "$target" in
+            tag:*) NEED_JSON=1 ;;
+        esac
+    done
+
+    if [ "$NEED_JSON" -eq 1 ]; then
+
+        if [ "$IS_OPENWRT" -eq 1 ]; then
+            command -v jsonfilter >/dev/null 2>&1 ||
+                _die "jsonfilter is required on OpenWrt."
+        else
+            command -v jq >/dev/null 2>&1 ||
+                _die "jq is required on Debian."
+        fi
+
+        get_tailscale_status || return 1
+    fi
+
+    # Iterate through configured targets.
+    for target in $TW_PING_TARGETS; do
+
+        case "$target" in
+            tag:*)
+
+                _debug "Resolving Tailscale ACL tag: $target"
+
+                tag_ips=$(get_tag_peer_ips "$target")
+
+                if [ -z "$tag_ips" ]; then
+                    _warn "No Tailscale peers found for tag: $target"
+                    continue
+                fi
+
+                for ip_address in $tag_ips; do
+                    _debug "Checking tagged peer: $target ($ip_address)"
+
+                    if tailscale ping --c=1 --timeout=5s \
+                        "$ip_address" >/dev/null 2>&1; then
+
+                        _info "Tailscale target reachable: $target ($ip_address)"
+                        return 0
+                    fi
+
+                    _debug "Tagged peer unreachable: $ip_address"
+                done
+                ;;
+
+            *)
+                # Direct IP address target.
+                _debug "Checking Tailscale IP: $target"
+
+                if tailscale ping --c=1 --timeout=5s \
+                    "$target" >/dev/null 2>&1; then
+
+                    _info "Tailscale target reachable: $target"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    _warn "None of the configured Tailscale targets are reachable."
+    return 1
+}
+
+check_tailscale_status() {
+    if ! tailscale status >/dev/null 2>&1; then
+        _warn "Tailscale daemon status check failed."
+        return 1
+    fi
+
+    _info "Tailscale daemon status OK."
+    return 0
+}
+
+
+# --- ZEROTIER CHECKS ---
+
+# Get status of the configured ZeroTier network.
+get_zerotier_network_status() {
+    zerotier-cli listnetworks 2>/dev/null |
+        awk -v nwid="$TW_ZT_NETWORK_ID" '
+            $1 == "200" && $2 == "listnetworks" && $3 == nwid {
+                print $6
+                found = 1
+            }
+            END {
+                if (!found) exit 1
+            }
+        '
+}
+
+is_zerotier_network_ok() {
+    ZT_STATUS=$(get_zerotier_network_status) || return 1
+    [ "$ZT_STATUS" = "OK" ]
+}
+
+activate_zerotier() {
+    if [ -z "$TW_ZT_NETWORK_ID" ]; then
+        _warn "ZeroTier fallback is not configured."
+        return 1
+    fi
+
+    if ! command -v zerotier-cli >/dev/null 2>&1; then
+        _err "zerotier-cli unavailable."
+        return 1
+    fi
+
+    if is_zerotier_network_ok; then
+        _info "ZeroTier network verified ONLINE (OK)."
+        return 0
+    fi
+
+    _warn "Starting ZeroTier service..."
+
+    if ! manage_zerotier start; then
+        _err "Unable to start ZeroTier service."
+        return 1
+    fi
+
+    ZT_STATUS=$(get_zerotier_network_status)
+
+    # Join only if the network is not already listed.
+    if [ -z "$ZT_STATUS" ]; then
+        _info "Joining ZeroTier network: $TW_ZT_NETWORK_ID"
+
+        if ! zerotier-cli join "$TW_ZT_NETWORK_ID"; then
+            _err "Unable to join ZeroTier network."
+            return 1
+        fi
+    else
+        _warn "ZeroTier network membership status: $ZT_STATUS"
+    fi
+
+    # Verify actual network membership status.
+    if is_zerotier_network_ok; then
+        _info "ZeroTier network verified ONLINE (OK)."
+        return 0
+    fi
+
+    _warn "ZeroTier network has not reached OK status yet."
+    return 1
+}
+
+
+# --- FAILURE COUNTER ---
+
+load_fail_count() {
+    FAIL_COUNT=0
+
+    if [ -f "$COUNTER_FILE" ]; then
+        stored_count=$(cat "$COUNTER_FILE" 2>/dev/null)
+
+        case "$stored_count" in
+            ''|*[!0-9]*|0*)
+                _warn "Invalid failure counter. Resetting."
+                FAIL_COUNT=0
+                ;;
+            *)
+                FAIL_COUNT=$stored_count
+                ;;
+        esac
+    fi
+}
+
+save_fail_count() {
+    printf '%s\n' "$FAIL_COUNT" > "$COUNTER_FILE" ||
+        _die "Unable to save failure counter."
+}
+
+reset_fail_count() {
+    rm -f "$COUNTER_FILE" "$PERSIST_MARKER"
+    _info "Tailscale recovered. Failure counter and reboot marker cleared."
+}
+
+
+# --- REMEDIATION ---
+
+remediate_failure() {
+
+    # Persistent marker means reboot was already attempted.
+    if [ -f "$PERSIST_MARKER" ]; then
+        _warn "Post-reboot failure detected. Skipping further reboot attempts."
+        rm -f "$PERSIST_MARKER"
+        FAIL_COUNT=$TW_MAX_FAIL
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+
+    save_fail_count
+
+    _warn "Consecutive Tailscale failures: $FAIL_COUNT / $TW_MAX_FAIL"
+
+    # STEP 1: Restart Tailscale.
+    if [ "$FAIL_COUNT" -eq 1 ]; then
+        _warn "Escalation 1: Restarting Tailscale daemon."
+
+        if ! manage_tailscale restart; then
+            _err "Tailscale daemon restart failed."
+            return 1
+        fi
+
+        return 0
+    fi
+
+    # STEP 2: Reboot once (optional).
+    if [ "$FAIL_COUNT" -eq 2 ] && [ "$TW_FLAG_REBOOT" -eq 1 ]; then
+        _warn "Escalation 2: Preparing system reboot."
+
+        mkdir -p "$PERSIST_DIR" ||
+            _die "Unable to create persistent directory."
+
+        touch "$PERSIST_MARKER" ||
+            _die "Unable to create reboot marker."
+
+        sync
+        reboot
+        return $?
+    fi
+
+    # STEP 3: Activate ZeroTier.
+    if [ "$FAIL_COUNT" -ge "$TW_MAX_FAIL" ]; then
+        _warn "Escalation 3: Activating ZeroTier fallback."
+        activate_zerotier
+        return $?
+    fi
+
+    _info "Waiting for next watchdog execution."
+    return 0
+}
+
+
+# --- MAIN WATCHDOG LOGIC ---
+
+main() {
+    _quit_if_no_root_privileges
+    validate_config
+    init_environment
+    load_fail_count
+
+    _info "Executing Tailscale watchdog checks..."
+
+    TS_FAILED=0
+
+    # CHECK 1: Tailscale interface.
+    if ! has_tailscale_interface; then
+        _warn "Tailscale interface tailscale0 is missing."
+        TS_FAILED=1
+    else
+        _info "Check 1: Tailscale interface OK."
+
+        # CHECK 2: Data-plane or daemon status.
+        if [ -n "$TW_PING_TARGETS" ]; then
+            check_tailscale_targets || TS_FAILED=1
+        else
+            check_tailscale_status || TS_FAILED=1
+        fi
+    fi
+
+    # SUCCESS: Tailscale is healthy.
+    if [ "$TS_FAILED" -eq 0 ]; then
+        reset_fail_count
+        rm -f "$WAN_FLAG_FILE"
+        _info "All Tailscale checks passed."
+        return 0
+    fi
+
+    _warn "Tailscale health check failed."
+
+    # EXCEPTION: WAN unavailable.
+    if ! is_wan_available; then
+        _warn "Public Internet WAN unavailable."
+        restart_network
+        return 1
+    fi
+
+    # WAN restored: clear stale marker.
+    if [ -f "$WAN_FLAG_FILE" ]; then
+        _info "WAN connectivity restored."
+        rm -f "$WAN_FLAG_FILE"
+    fi
+
+    # WAN available: proceed with Tailscale remediation.
+    remediate_failure
+}
+
 main "$@"
+
