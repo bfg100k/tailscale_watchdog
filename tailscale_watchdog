@@ -715,7 +715,7 @@ remediate_failure() {
 # --- MAIN WATCHDOG LOGIC ---
 
 main() {
-    _info "Executing Tailscale watchdog checks..."
+    _debug "Executing Tailscale watchdog checks..."
 
     TS_FAILED=0
 
@@ -724,7 +724,7 @@ main() {
         _warn "Tailscale interface tailscale0 is missing."
         TS_FAILED=1
     else
-        _info "Check 1: Tailscale interface OK."
+        _debug "Check 1: Tailscale interface OK."
 
         # CHECK 2: Data-plane or daemon status.
         if [ -n "$TW_PING_TARGETS" ]; then
