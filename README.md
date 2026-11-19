@@ -1,12 +1,14 @@
 # tailscale_watchdog
-Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy. Recovery options include:
+Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy.
+Health status is determined by checking if a remote node is reachable or the tailscale daemon status.
+Recovery options include:
 - Restart tailscale service
 - Reboot machine
 - Start ZeroTier service (as backup tunnel for manual recovery. Useful in situations where the node can only be accessed remotely)
+Note that the watchdog ignores WAN failures and will attempt network stack recovery ***once*** per WAN outage.
 
 ## Files
-- `tailscale_watchdog`: foreground POSIX sh watchdog. Default mode is `--loop`; `--once`
-  remains available for manual testing.
+- `tailscale_watchdog`: foreground POSIX sh watchdog. Default mode is `--loop`; `--once` available for manual testing.
 - `tailscale-watchdog.service`: Debian systemd unit.
 - `tailscale_watchdog.init`: OpenWrt `/etc/init.d` service using procd.
 - `tailscale_watchdog.conf.example`: example external configuration file.
@@ -27,12 +29,15 @@ ordered after `network-online.target`.
 
 ### OpenWrt
 ```sh
-install -m 0755 tailscale_watchdog /usr/sbin/tailscale_watchdog
-install -m 0755 tailscale_watchdog.init /etc/init.d/tailscale_watchdog
-install -m 0600 tailscale_watchdog.conf.example /etc/tailscale_watchdog.conf
+sudo cp tailscale_watchdog /usr/sbin/tailscale_watchdog
+sudo chmod 0755 /usr/sbin/tailscale_watchdog
+sudo cp tailscale_watchdog.init /etc/init.d/tailscale_watchdog
+sudo chmod 0755 /etc/init.d/tailscale_watchdog
+sudo cp tailscale_watchdog.conf.example /etc/tailscale_watchdog.conf
+sudo chmod 0600 /etc/tailscale_watchdog.conf
 # Edit /etc/tailscale_watchdog.conf before starting the service.
-/etc/init.d/tailscale_watchdog enable
-/etc/init.d/tailscale_watchdog start
+sudo /etc/init.d/tailscale_watchdog enable
+sudo /etc/init.d/tailscale_watchdog start
 ```
 
 The procd init script uses `START=99` so the watchdog is started late in the
@@ -85,8 +90,8 @@ tailscale_watchdog --once
 
 ### Logs
 - Debian: `journalctl -u tailscale-watchdog.service -f`
-- OpenWrt: `logread -f`
+- OpenWrt: `logread -f | grep tailscale_watchdog`
 
 ### Service status
 - Debian: `systemctl status tailscale-watchdog`
-- OpenWrt: `service tailscale-watchdog status`
+- OpenWrt: `service tailscale_watchdog status`
