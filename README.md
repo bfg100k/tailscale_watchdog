@@ -1,10 +1,13 @@
 # tailscale_watchdog
 Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy.
+
 Health status is determined by checking if a remote node is reachable or the tailscale daemon status.
+
 Recovery options include:
 - Restart tailscale service
 - Reboot machine
 - Start ZeroTier service (as backup tunnel for manual recovery. Useful in situations where the node can only be accessed remotely)
+
 Note that the watchdog ignores WAN failures and will attempt network stack recovery ***once*** per WAN outage.
 
 ## Files
