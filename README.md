@@ -1,5 +1,8 @@
 # tailscale_watchdog
-Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy.
+Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy. Recovery options include:
+- Restart tailscale service
+- Reboot machine
+- Start ZeroTier service (as backup tunnel for manual recovery. Useful in situations where the node can only be accessed remotely)
 
 ## Files
 - `tailscale_watchdog`: foreground POSIX sh watchdog. Default mode is `--loop`; `--once`
@@ -8,7 +11,8 @@ Simple service / script to monitor health of the Tailscale service and attempt r
 - `tailscale_watchdog.init`: OpenWrt `/etc/init.d` service using procd.
 - `tailscale_watchdog.conf.example`: example external configuration file.
 
-## Debian installation
+## Installation
+### Debian
 ```sh
 install -m 0755 tailscale_watchdog /usr/local/sbin/tailscale_watchdog
 install -m 0644 tailscale-watchdog.service /etc/systemd/system/tailscale-watchdog.service
@@ -21,7 +25,7 @@ systemctl enable --now tailscale-watchdog.service
 The systemd unit requires and starts after `tailscaled.service`, as well as being
 ordered after `network-online.target`.
 
-## OpenWrt installation
+### OpenWrt
 ```sh
 install -m 0755 tailscale_watchdog /usr/sbin/tailscale_watchdog
 install -m 0755 tailscale_watchdog.init /etc/init.d/tailscale_watchdog
@@ -72,11 +76,17 @@ threshold, rebooted once, and restarted on subsequent failed checks.
 Discord notifications are optional and require `curl`. The watchdog continues
 its remediation even if the webhook request fails.
 
-## Manual one-shot test
+## Troubleshooting
+
+### Manual one-shot test
 ```sh
 tailscale_watchdog --once
 ```
 
-## Logs
+### Logs
 - Debian: `journalctl -u tailscale-watchdog.service -f`
 - OpenWrt: `logread -f`
+
+### Service status
+- Debian: `systemctl status tailscale-watchdog`
+- OpenWrt: `service tailscale-watchdog status`

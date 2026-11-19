@@ -195,6 +195,7 @@ init_environment() {
         NETWORK_RESTART_FN=restart_network_openwrt
         if command -v jsonfilter >/dev/null 2>&1; then
             TAG_IP_PARSER_FN=get_tag_peer_ips_jsonfilter
+            SELF_IP_PARSER_FN=get_self_tailscale_ips_jsonfilter
         fi
     else
         IS_OPENWRT=0
@@ -211,6 +212,7 @@ init_environment() {
         fi
         if command -v jq >/dev/null 2>&1; then
             TAG_IP_PARSER_FN=get_tag_peer_ips_jq
+            SELF_IP_PARSER_FN=get_self_tailscale_ips_jq
         fi
     fi
 
@@ -228,16 +230,26 @@ init_environment() {
         _die "Neither ip nor ifconfig is available."
     fi
 
-    # Determine once whether ACL-tag expansion is needed.
-    case " $TW_PING_TARGETS " in
-        *" tag:"*) HAS_TAG_TARGETS=1 ;;
-        *) HAS_TAG_TARGETS=0 ;;
-    esac
+    # Determine once whether targets are configured and whether any require
+    # ACL-tag expansion.
+    HAS_PING_TARGETS=0
+    HAS_TAG_TARGETS=0
+    for configured_target in $TW_PING_TARGETS; do
+        HAS_PING_TARGETS=1
+        case "$configured_target" in
+            tag:*) HAS_TAG_TARGETS=1 ;;
+        esac
+    done
 
-    # Validate the JSON parser once if ACL tags are configured.
+    # A status JSON parser is required for self-IP exclusion whenever targets
+    # are configured, and for tag expansion when ACL tags are present.
+    if [ "$HAS_PING_TARGETS" -eq 1 ]; then
+        [ -n "$SELF_IP_PARSER_FN" ] ||
+            _die "Required Tailscale self-IP JSON parser is unavailable."
+    fi
     if [ "$HAS_TAG_TARGETS" -eq 1 ]; then
         [ -n "$TAG_IP_PARSER_FN" ] ||
-            _die "Required Tailscale JSON parser is unavailable."
+            _die "Required Tailscale tag JSON parser is unavailable."
     fi
 
     VOLATILE_DIR="/tmp/ts_watchdog"
@@ -377,27 +389,46 @@ get_tag_peer_ips() {
     "$TAG_IP_PARSER_FN" "$1"
 }
 
+# Read this node's own Tailscale IPs from the same status snapshot used for
+# tag expansion. Keeping this in the platform-specific parser avoids extra
+# tailscale CLI calls during cache refreshes.
+get_self_tailscale_ips_jsonfilter() {
+    jsonfilter -i "$STATUS_FILE" -e '@.Self.TailscaleIPs[*]' 2>/dev/null
+}
+
+get_self_tailscale_ips_jq() {
+    jq -r '.Self.TailscaleIPs[]?' "$STATUS_FILE" 2>/dev/null
+}
+
+get_self_tailscale_ips() {
+    "$SELF_IP_PARSER_FN"
+}
+
+# Return success when the supplied address belongs to this node.
+is_self_tailscale_ip() {
+    candidate_ip=$1
+    for self_ip in $SELF_TAILSCALE_IPS; do
+        [ "$candidate_ip" = "$self_ip" ] && return 0
+    done
+    return 1
+}
+
 # Rebuild the resolved target list atomically in memory. Direct IP targets
-# are copied unchanged; tag targets are expanded from one status snapshot.
+# are copied unchanged unless they identify this node; tag targets are
+# expanded from one status snapshot with this node excluded.
 # If status retrieval fails, retain the previous cache when one exists.
 refresh_ping_target_cache() {
     new_cache=
-    has_tag_targets=0
 
-    for configured_target in $TW_PING_TARGETS; do
-        case "$configured_target" in
-            tag:*) has_tag_targets=1 ;;
-            *) new_cache="$new_cache $configured_target" ;;
-        esac
-    done
-
-    if [ "$has_tag_targets" -eq 1 ]; then
+    if [ "$HAS_PING_TARGETS" -eq 1 ]; then
         if ! get_tailscale_status; then
-            _err "Unable to refresh Tailscale tag peer cache."
+            _err "Unable to refresh Tailscale target cache."
             [ "$TAG_IP_CACHE_VALID" -eq 1 ] && return 0
-            PING_TARGET_CACHE=$new_cache
+            PING_TARGET_CACHE=
             return 1
         fi
+
+        SELF_TAILSCALE_IPS=$(get_self_tailscale_ips) || SELF_TAILSCALE_IPS=
 
         for configured_target in $TW_PING_TARGETS; do
             case "$configured_target" in
@@ -407,8 +438,19 @@ refresh_ping_target_cache() {
                         _debug "No online Tailscale peers found for tag: $configured_target"
                     else
                         for cached_ip in $tag_ips; do
-                            new_cache="$new_cache $cached_ip"
+                            if ! is_self_tailscale_ip "$cached_ip"; then
+                                new_cache="$new_cache $cached_ip"
+                            else
+                                _debug "Skipping own Tailscale IP: $cached_ip"
+                            fi
                         done
+                    fi
+                    ;;
+                *)
+                    if ! is_self_tailscale_ip "$configured_target"; then
+                        new_cache="$new_cache $configured_target"
+                    else
+                        _debug "Skipping own Tailscale IP: $configured_target"
                     fi
                     ;;
             esac
@@ -423,7 +465,7 @@ refresh_ping_target_cache() {
 }
 
 refresh_ping_target_cache_if_due() {
-    [ "$HAS_TAG_TARGETS" -eq 1 ] || return 0
+    [ "$HAS_PING_TARGETS" -eq 1 ] || return 0
 
     if [ "$TAG_CACHE_AGE" -ge "$TW_TAG_CACHE_INTERVAL" ]; then
         refresh_ping_target_cache || :
