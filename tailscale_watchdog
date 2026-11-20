@@ -35,8 +35,7 @@ TW_TAG_CACHE_INTERVAL=10
 TW_DISCORD_WEBHOOK=""
 
 # Log levels: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR
-# INFO is disabled by default to avoid one journal/syslog entry per interval.
-: "${LOG:=3}"
+: "${LOG:=2}"
 
 # Leave empty when managed by systemd/procd; they capture stdout/stderr.
 # Set to a syslog tag if direct logger integration is preferred.
@@ -268,6 +267,25 @@ init_environment() {
     PING_TARGET_CACHE=
 }
 
+print_config() {
+    _info "Performing health check every $TW_CHECK_INTERVAL seconds."
+    if [ "$HAS_PING_TARGETS" -eq 1 ]; then
+        _info "Health check type - PING remote node"
+        _info "Refreshing PING Targets cache every $TW_TAG_CACHE_INTERVAL checks."
+    else
+        _info "Health check type - local tailscaled status"
+    fi
+    if [ "$REBOOT_THRESHOLD" -gt 0 ]; then
+        _info "Rebooting system after $REBOOT_THRESHOLD consecutive failures."
+    fi
+	if [ "$ZT_THRESHOLD" -gt 0 ]; then
+	    _info "Starting fallback ZeroTier service after $ZT_THRESHOLD consecutive failures."
+		_info "Configured ZeroTier network ID is $TW_ZT_NETWORK_ID."
+	fi
+    if [ -n "$TW_DISCORD_WEBHOOK" ]; then
+        _info "Discord webhook set. Will send notification when remediation is attempted."
+    fi
+}
 
 # --- SERVICE MANAGERS ---
 
@@ -435,7 +453,7 @@ refresh_ping_target_cache() {
                 tag:*)
                     tag_ips=$(get_tag_peer_ips "$configured_target") || tag_ips=
                     if [ -z "$tag_ips" ]; then
-                        _debug "No online Tailscale peers found for tag: $configured_target"
+                        _warn "No online Tailscale peers found for tag: $configured_target"
                     else
                         for cached_ip in $tag_ips; do
                             if ! is_self_tailscale_ip "$cached_ip"; then
@@ -450,7 +468,7 @@ refresh_ping_target_cache() {
                     if ! is_self_tailscale_ip "$configured_target"; then
                         new_cache="$new_cache $configured_target"
                     else
-                        _debug "Skipping own Tailscale IP: $configured_target"
+                        _warn "Ignoring own Tailscale IP ($configured_target) as a PING Target."
                     fi
                     ;;
             esac
@@ -459,8 +477,9 @@ refresh_ping_target_cache() {
 
     # Strip leading whitespace and publish the complete new cache.
     PING_TARGET_CACHE=${new_cache# }
+	_debug "Refreshed PING Targets cache: $PING_TARGET_CACHE"
     TAG_IP_CACHE_VALID=1
-    _debug "Tailscale target cache refreshed."
+    _info "Tailscale target cache refreshed. Found $(printf '%s\n' "$PING_TARGET_CACHE" | wc -w) targets."
     return 0
 }
 
@@ -799,6 +818,7 @@ case "${1:-}" in
         ;;
     --loop|'')
         startup
+        [ "$LOG" -le 2 ] && print_config
         run_loop
         ;;
     --help|-h)
