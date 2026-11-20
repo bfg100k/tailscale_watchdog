@@ -18,6 +18,9 @@ TW_FAIL_REBOOT=3
 # Empty, zero, or a negative value disables ZeroTier escalation.
 TW_FAIL_START_ZT=4
 
+# Gives Tailscale time to initialise after the watchdog starts
+TW_STARTUP_DELAY=60
+
 # Seconds between completed watchdog checks.
 TW_CHECK_INTERVAL=60
 

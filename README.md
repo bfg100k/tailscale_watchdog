@@ -59,6 +59,7 @@ escalation values.
 | `TW_ZT_NETWORK_ID` | empty | ZeroTier network ID; must be exactly 16 hexadecimal characters when ZeroTier escalation is enabled. |
 | `TW_FAIL_REBOOT` | empty | Reboot threshold. Empty, zero, or negative disables reboot. Reboot is attempted once at exactly this failure count. |
 | `TW_FAIL_START_ZT` | empty | ZeroTier activation threshold. Empty, zero, or negative disables it. When both thresholds are positive, this must be greater than `TW_FAIL_REBOOT`. |
+| `TW_STARTUP_DELAY` | `60` | Seconds to wait before starting the first health check. This is required to allow tailscale time to startup completely when this service is configured to start on system bootup. |
 | `TW_CHECK_INTERVAL` | `60` | Seconds to wait after each completed check. The check-start interval is this value plus the time spent checking/remediating. |
 | `TW_TAG_CACHE_INTERVAL` | `10` | Number of checks between ACL-tag peer cache refreshes. The first refresh occurs on startup. Cached IPs are pinged on every check. |
 | `TW_DISCORD_WEBHOOK` | empty | Optional Discord webhook URL. A best-effort notification is sent immediately before each remediation action. Notification failures do not block remediation. |

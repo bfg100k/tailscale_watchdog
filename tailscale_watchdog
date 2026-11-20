@@ -30,6 +30,7 @@ TW_PING_TARGETS=""
 TW_ZT_NETWORK_ID=""
 TW_FAIL_REBOOT=""
 TW_FAIL_START_ZT=""
+TW_STARTUP_DELAY=60
 TW_CHECK_INTERVAL=60
 TW_TAG_CACHE_INTERVAL=10
 TW_DISCORD_WEBHOOK=""
@@ -799,9 +800,13 @@ startup() {
 
 run_loop() {
     # Run in the foreground. systemd/procd supervise this process directly.
-    # A failed health check is not a process failure; main() reports it and
-    # the next check runs after TW_CHECK_INTERVAL seconds.
+	# First check starts AFTER TW_STARTUP_DELAY seconds to allow tailscale
+	# time to initialise. A failed health check is not a process failure; 
+	# main() reports it and the next check runs after TW_CHECK_INTERVAL seconds.
     trap 'exit 0' HUP INT TERM
+
+    _info "Watchdog starting. Initial delay: ${TW_STARTUP_DELAY}s"
+    sleep "$TW_STARTUP_DELAY"
 
     while :; do
         main || :
