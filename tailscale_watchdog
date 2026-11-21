@@ -246,6 +246,12 @@ init_environment() {
         _die "Neither ip nor ifconfig is available."
     fi
 
+    # Normalise this option once; the main check loop only needs a boolean.
+    PING_ALWAYS=0
+    if [ -n "$TW_PING_ALWAYS" ] && [ "$TW_PING_ALWAYS" != 0 ]; then
+        PING_ALWAYS=1
+    fi
+
     # Determine once whether targets are configured and whether any require
     # ACL-tag expansion.
     HAS_PING_TARGETS=0
@@ -769,8 +775,8 @@ main() {
         _debug "Check 1: Tailscale interface OK."
 
         # CHECK 2: Data-plane or daemon status.
-        if [ -n "$TW_PING_TARGETS" ]; then
-            if [ -n "$TW_PING_ALWAYS" ] && [ "$TW_PING_ALWAYS" != 0 ]; then
+        if [ "$HAS_PING_TARGETS" -eq 1 ]; then
+            if [ "$PING_ALWAYS" -eq 1 ]; then
                 _debug "TW_PING_ALWAYS enabled; checking configured PING Targets."
                 check_tailscale_targets || TS_FAILED=1
             else
