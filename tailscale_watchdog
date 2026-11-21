@@ -293,7 +293,7 @@ init_environment() {
 print_config() {
     _info "Performing health check every $TW_CHECK_INTERVAL seconds."
     if [ "$HAS_PING_TARGETS" -eq 1 ]; then
-	    if [ "$PING_AWLAYS" -eq 1]; then
+	    if [ "$PING_ALWAYS" -eq 1 ]; then
             _info "Health check type - PING remote node ALWAYS"
         else
             _info "Health check type - PING remote node if no active connections found"
