@@ -27,6 +27,7 @@ CONFIG_FILE="/etc/tailscale_watchdog.conf"
 
 # Defaults (overridden by CONFIG_FILE when it exists).
 TW_PING_TARGETS=""
+TW_PING_ALWAYS=""
 TW_ZT_NETWORK_ID=""
 TW_FAIL_REBOOT=""
 TW_FAIL_START_ZT=""
@@ -516,6 +517,30 @@ check_tailscale_targets() {
     return 1
 }
 
+# Return 0 when at least one remote peer is active, 1 when none are active,
+# or 2 when the status query fails. Comment and blank lines are ignored.
+check_tailscale_active_connections() {
+    if [ -z "$TAILSCALE_BIN" ]; then
+        _err "Tailscale CLI unavailable."
+        return 2
+    fi
+
+    active_status=$("$TAILSCALE_BIN" status --active --self=false 2>/dev/null)
+    status_rc=$?
+    if [ "$status_rc" -ne 0 ]; then
+        _warn "Unable to retrieve active Tailscale connections."
+        return 2
+    fi
+
+    if printf '%s\n' "$active_status" | grep -Eqv '^#|^[[:space:]]*$'; then
+        _debug "Active Tailscale connections detected."
+        return 0
+    fi
+
+    _debug "No active Tailscale connections detected."
+    return 1
+}
+
 check_tailscale_status() {
     if [ -z "$TAILSCALE_BIN" ] || ! "$TAILSCALE_BIN" status >/dev/null 2>&1; then
         _warn "Tailscale daemon status check failed."
@@ -748,7 +773,26 @@ main() {
 
         # CHECK 2: Data-plane or daemon status.
         if [ -n "$TW_PING_TARGETS" ]; then
-            check_tailscale_targets || TS_FAILED=1
+            if [ -n "$TW_PING_ALWAYS" ] && [ "$TW_PING_ALWAYS" != 0 ]; then
+                _debug "TW_PING_ALWAYS enabled; checking configured PING Targets."
+                check_tailscale_targets || TS_FAILED=1
+            else
+                check_tailscale_active_connections
+                active_status=$?
+                case "$active_status" in
+                    0)
+                        _debug "Active Tailscale connections detected; skipping PING Targets."
+                        ;;
+                    1)
+                        _debug "No active Tailscale connections; checking configured PING Targets."
+                        check_tailscale_targets || TS_FAILED=1
+                        ;;
+                    *)
+                        _warn "Falling back to PING Targets because active connections could not be checked."
+                        check_tailscale_targets || TS_FAILED=1
+                        ;;
+                esac
+            fi
         else
             check_tailscale_status || TS_FAILED=1
         fi

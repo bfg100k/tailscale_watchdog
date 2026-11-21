@@ -5,6 +5,11 @@
 # Any one reachable target is sufficient. Leave empty to check daemon status.
 TW_PING_TARGETS="100.64.0.1 tag:server tag:router"
 
+# Leave empty or set to 0 to ping targets only when no remote peers are active.
+# Set to any non-zero value (e.g. 1) to ping targets on every health check.
+# Ignored when TW_PING_TARGETS is empty.
+TW_PING_ALWAYS=""
+
 # Optional ZeroTier fallback. Required when TW_FAIL_START_ZT is positive.
 # Replace this example with your actual 16-character network ID.
 TW_ZT_NETWORK_ID="abcdef0123456789"

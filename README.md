@@ -55,8 +55,8 @@ escalation values.
 
 | Setting | Default | Description |
 |---|---:|---|
-| `TW_PING_TARGETS` | empty | Space-separated Tailnet IPs and/or `tag:` ACL tags. Targets will be pinged one at a time in the order specified *when daemon status shows no active connections*. First successful target pinged is sufficient. |
-| `TW_PING_ALWAYS` | empty | If defined and not 0, skip daemon status check and ping targets always. This flag is ignored if no ping targets are set. |
+| `TW_PING_TARGETS` | empty | Space-separated Tailnet IPs and/or `tag:` ACL tags. When no remote peers are active, targets are pinged in order; the first successful ping is sufficient. If empty, daemon status is checked instead. |
+| `TW_PING_ALWAYS` | empty | If defined and not `0`, ping configured targets on every check without first checking active peers. Otherwise, targets are pinged only when `tailscale status --active --self=false` reports no active remote peers. If the active-peer query fails, the watchdog falls back to pinging configured targets. Ignored when `TW_PING_TARGETS` is empty. |
 | `TW_ZT_NETWORK_ID` | empty | ZeroTier network ID; must be exactly 16 hexadecimal characters when ZeroTier escalation is enabled. |
 | `TW_FAIL_REBOOT` | empty | Reboot threshold. Empty, zero, or negative disables reboot. Reboot is attempted once at exactly this failure count. |
 | `TW_FAIL_START_ZT` | empty | ZeroTier activation threshold. Empty, zero, or negative disables it. When both thresholds are positive, this must be greater than `TW_FAIL_REBOOT`. |
