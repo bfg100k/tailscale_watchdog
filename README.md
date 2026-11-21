@@ -1,9 +1,9 @@
 # tailscale_watchdog
-Simple service / script to monitor health of the Tailscale service and attempt recovery if unhealthy.
+Simple service / script to monitor health of the Tailscale service and attempt recovery if found to be unhealthy.
 
-Health status is determined by checking if a remote node is reachable or the tailscale daemon status.
+Health status is determined by checking the output of the `tailscale status` command. Optionally, it will ping a remote tailscale node if configured.
 
-Recovery options include:
+Three types of recovery methods are included [(see failure escalation for more details)](#failure-escalation):
 - Restart tailscale service
 - Reboot machine
 - Start ZeroTier service (as backup tunnel for manual recovery. Useful in situations where the node can only be accessed remotely)
@@ -55,7 +55,8 @@ escalation values.
 
 | Setting | Default | Description |
 |---|---:|---|
-| `TW_PING_TARGETS` | empty | Space-separated Tailnet IPs and/or `tag:` ACL tags. Any one reachable target is sufficient. If empty, daemon status is checked instead. |
+| `TW_PING_TARGETS` | empty | Space-separated Tailnet IPs and/or `tag:` ACL tags. Targets will be pinged one at a time in the order specified *when daemon status shows no active connections*. First successful target pinged is sufficient. |
+| `TW_PING_ALWAYS` | empty | If defined and not 0, skip daemon status check and ping targets always. This flag is ignored if no ping targets are set. |
 | `TW_ZT_NETWORK_ID` | empty | ZeroTier network ID; must be exactly 16 hexadecimal characters when ZeroTier escalation is enabled. |
 | `TW_FAIL_REBOOT` | empty | Reboot threshold. Empty, zero, or negative disables reboot. Reboot is attempted once at exactly this failure count. |
 | `TW_FAIL_START_ZT` | empty | ZeroTier activation threshold. Empty, zero, or negative disables it. When both thresholds are positive, this must be greater than `TW_FAIL_REBOOT`. |
