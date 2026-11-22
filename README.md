@@ -10,7 +10,7 @@ Three types of recovery methods are included [(see failure escalation for more d
 
 ### Notes 
 - The watchdog ignores WAN failures (i.e. not treated as a tailscale service failure) and will attempt network stack recovery ***once*** per WAN outage.
-- The watchdog will not attempt to stop the ZeroTier service on recovery. This is to avoid accidentally killing any active connections.
+- Automatic ZeroTier cleanup on recovery is optional and disabled by default. When enabled, the watchdog only stops a service it started itself, after a grace period and repeated checks confirm there are no active connections or interface traffic.
 
 ## Files
 - `tailscale_watchdog`: foreground POSIX sh watchdog. Default mode is `--loop`; `--once` available for manual testing.
