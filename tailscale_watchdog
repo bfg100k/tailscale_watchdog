@@ -527,7 +527,7 @@ check_tailscale_targets() {
     for target in $PING_TARGET_CACHE; do
         _debug "Checking Tailscale target: $target"
 
-        if "$TAILSCALE_BIN" ping --c=1 --timeout=5s "$target" >/dev/null 2>&1; then
+        if "$TAILSCALE_BIN" ping --tsmp --c=1 --timeout=5s "$target" >/dev/null 2>&1; then
             _info "Tailscale target reachable: $target"
             return 0
         fi
