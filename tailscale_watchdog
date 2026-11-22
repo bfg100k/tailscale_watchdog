@@ -753,17 +753,14 @@ activate_zerotier() {
 zerotier_has_tracked_connections() {
     [ -n "$CONNTRACK_BIN" ] || return 2
 
-    zt_network_line=$("$ZEROTIER_BIN" listnetworks 2>/dev/null |
-        awk -v nwid="$TW_ZT_NETWORK_ID" '$1 == "200" && $2 == "listnetworks" && $3 == nwid { print $0; found=1; exit } END { if (!found) exit 1 }') || return 2
-    zt_iface=$(printf '%s\n' "$zt_network_line" | awk '{print $8}')
+    zt_iface=$1
     [ -n "$zt_iface" ] && [ "$zt_iface" != "-" ] || return 2
 
     [ -n "$ZT_INTERFACE_IP_FN" ] || return 2
     zt_local_ips=$("$ZT_INTERFACE_IP_FN" "$zt_iface")
     [ -n "$zt_local_ips" ] || return 2
 
-    zt_conntrack_output=$("$CONNTRACK_BIN" -L 2>/dev/null) || return 2
-    printf '%s\n' "$zt_conntrack_output" |
+    "$CONNTRACK_BIN" -L 2>/dev/null |
         awk -v addresses="$zt_local_ips" '
             BEGIN {
                 count = split(addresses, address, /[[:space:]]+/)
@@ -830,7 +827,7 @@ cleanup_zerotier() {
     zt_tx=$(cat "$zt_tx_file" 2>/dev/null) || return 0
     case "$zt_rx:$zt_tx" in *[!0-9:]*|:*) return 0 ;; esac
 
-    if zerotier_has_tracked_connections; then
+    if zerotier_has_tracked_connections "$zt_iface"; then
         _info "Tracked ZeroTier connection detected; postponing automatic stop."
         echo 0 > "$ZT_IDLE_COUNT_FILE"
         printf '%s\n' "$zt_rx" > "$ZT_LAST_RX_FILE"
