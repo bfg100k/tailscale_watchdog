@@ -34,15 +34,15 @@ ordered after `network-online.target`.
 
 ### OpenWrt
 ```sh
-sudo cp tailscale_watchdog /usr/sbin/tailscale_watchdog
-sudo chmod 0755 /usr/sbin/tailscale_watchdog
-sudo cp tailscale_watchdog.init /etc/init.d/tailscale_watchdog
-sudo chmod 0755 /etc/init.d/tailscale_watchdog
-sudo cp tailscale_watchdog.conf.example /etc/tailscale_watchdog.conf
-sudo chmod 0600 /etc/tailscale_watchdog.conf
+cp tailscale_watchdog /usr/sbin/tailscale_watchdog
+chmod 0755 /usr/sbin/tailscale_watchdog
+cp tailscale_watchdog.init /etc/init.d/tailscale_watchdog
+chmod 0755 /etc/init.d/tailscale_watchdog
+cp tailscale_watchdog.conf.example /etc/tailscale_watchdog.conf
+chmod 0600 /etc/tailscale_watchdog.conf
 # Edit /etc/tailscale_watchdog.conf before starting the service.
-sudo /etc/init.d/tailscale_watchdog enable
-sudo /etc/init.d/tailscale_watchdog start
+/etc/init.d/tailscale_watchdog enable
+/etc/init.d/tailscale_watchdog start
 ```
 
 The procd init script uses `START=99` so the watchdog is started late in the
