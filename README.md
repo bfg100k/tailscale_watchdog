@@ -70,10 +70,10 @@ escalation values.
 | `TW_CHECK_INTERVAL` | `60` | Seconds to wait after each completed check. The check-start interval is this value plus the time spent checking/remediating. |
 | `TW_TAG_CACHE_INTERVAL` | `10` | Number of checks between ACL-tag peer cache refreshes. The first refresh occurs on startup. Cached IPs are pinged on every check. |
 | `TW_DISCORD_WEBHOOK` | empty | Optional Discord webhook URL. A best-effort notification is sent immediately before each remediation action. Notification failures do not block remediation. |
-| `LOG` | `3` | Log level: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR. |
+| `LOG` | `2` | Log level: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR. |
 
 
-### Failure escalation
+## Failure escalation
 
 The watchdog supports two independent escalation thresholds:
 
@@ -90,7 +90,7 @@ Before ZeroTier has been activated, every failed check restarts the
 Tailscale daemon, except when a reboot is triggered at its configured
 threshold.
 
-#### Reboot escalation
+### Reboot escalation
 
 When `TW_FAIL_REBOOT` is reached, the watchdog:
 
@@ -104,7 +104,7 @@ restarting the Tailscale daemon on subsequent failed checks. The failure
 counter is restored from the persistent marker so escalation continues
 from the previous count rather than starting again from zero.
 
-#### ZeroTier escalation
+### ZeroTier escalation
 
 When `TW_FAIL_START_ZT` is reached, the watchdog:
 
@@ -129,7 +129,7 @@ at that threshold. After reboot, it restores the previously activated
 ZeroTier network and continues in fallback mode without restarting
 Tailscale.
 
-#### Combining both thresholds
+### Combining both thresholds
 
 The order of the two thresholds determines how the watchdog escalates:
 
@@ -148,7 +148,7 @@ ZeroTier network is online and can still reboot when the later reboot
 threshold is reached. After reboot, it remains in ZeroTier fallback
 mode and does not resume Tailscale restarts.
 
-#### Example escalation sequences
+### Example escalation sequences
 
 | Configuration | Escalation sequence |
 |---|---|
@@ -158,7 +158,7 @@ mode and does not resume Tailscale restarts.
 | Reboot = 4, ZeroTier = 6 | Restart Tailscale (1–3) → reboot (4) → restart Tailscale (5) → activate ZeroTier (6) → maintain ZeroTier fallback |
 | ZeroTier = 4, Reboot = 6 | Restart Tailscale (1–3) → activate ZeroTier (4) → maintain ZeroTier fallback → reboot (6) → continue ZeroTier fallback |
 
-#### Recovery and ZeroTier cleanup
+### Recovery and ZeroTier cleanup
 
 When Tailscale recovers, the watchdog clears the failure escalation and
 restoration markers.
