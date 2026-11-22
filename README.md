@@ -61,7 +61,11 @@ escalation values.
 | `TW_PING_ALWAYS` | empty | If defined and not `0`, ping configured targets on every check without first checking active peers. Otherwise, targets are pinged only when `tailscale status --active --self=false` reports no active remote peers. If the active-peer query fails, the watchdog falls back to pinging configured targets. Ignored when `TW_PING_TARGETS` is empty. |
 | `TW_ZT_NETWORK_ID` | empty | ZeroTier network ID; must be exactly 16 hexadecimal characters when ZeroTier escalation is enabled. |
 | `TW_FAIL_REBOOT` | empty | Reboot threshold. Empty, zero, or negative disables reboot. Reboot is attempted once at exactly this failure count. |
-| `TW_FAIL_START_ZT` | empty | ZeroTier activation threshold. Empty, zero, or negative disables it. When both thresholds are positive, this must be greater than `TW_FAIL_REBOOT`. |
+| `TW_FAIL_START_ZT` | empty | ZeroTier activation threshold. Empty, zero, or negative disables it. It may be before or after `TW_FAIL_REBOOT`; equal positive thresholds are rejected. |
+| `TW_STOP_ZT_ON_RECOVERY` | `0` | Automatically stop ZeroTier after Tailscale recovery, but only if the watchdog started the daemon. Requires `conntrack`; missing or inconclusive detection leaves ZeroTier running. |
+| `TW_ZT_RECOVERY_GRACE` | `600` | Seconds to wait after Tailscale recovery before considering ZeroTier cleanup. |
+| `TW_ZT_IDLE_CHECKS` | `3` | Consecutive idle observations required before stopping ZeroTier. |
+| `TW_ZT_IDLE_INTERVAL` | `60` | Minimum seconds between idle observations. |
 | `TW_STARTUP_DELAY` | `60` | Seconds to wait before starting the first health check. This is required to allow tailscale time to startup completely when this service is configured to start on system bootup. |
 | `TW_CHECK_INTERVAL` | `60` | Seconds to wait after each completed check. The check-start interval is this value plus the time spent checking/remediating. |
 | `TW_TAG_CACHE_INTERVAL` | `10` | Number of checks between ACL-tag peer cache refreshes. The first refresh occurs on startup. Cached IPs are pinged on every check. |
@@ -76,9 +80,16 @@ a persistent marker, and attempts one reboot. The marker prevents another reboot
 following startup. If Tailscale remains unhealthy after reboot, subsequent failed
 checks restart Tailscale rather than rebooting again.
 - At `TW_FAIL_START_ZT`, the watchdog sends a notification and attempts to activate
-ZeroTier. Further failed checks do not repeat activation or perform other
-remediation. Tailscale recovery resets the failure count and clears the reboot
-marker, allowing escalation to begin again if needed.
+  ZeroTier. Either escalation threshold may come first; equal positive thresholds
+  are rejected. After ZeroTier escalation, the watchdog waits for recovery or a
+  later configured reboot threshold. If reboot follows ZeroTier escalation, a
+  persistent marker causes ZeroTier to be restored after watchdog startup without
+  enabling its service permanently at boot. Tailscale recovery clears the
+  escalation/restoration markers.
+- Optional automatic cleanup waits for the configured recovery grace period, then
+  requires no conntrack entries involving the node's ZeroTier addresses and no
+  interface-counter changes across the configured consecutive idle observations.
+  It never stops a daemon that was already running before watchdog activation.
 - If both thresholds are disabled, Tailscale is restarted on every failed check.
 - If only ZeroTier escalation is enabled, Tailscale is restarted until the
 ZeroTier threshold is reached.

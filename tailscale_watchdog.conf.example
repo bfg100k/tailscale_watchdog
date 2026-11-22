@@ -19,9 +19,20 @@ TW_ZT_NETWORK_ID="abcdef0123456789"
 TW_FAIL_REBOOT=3
 
 # Start ZeroTier after this many consecutive failed checks.
-# Must be greater than TW_FAIL_REBOOT when both are enabled.
+# May be before or after TW_FAIL_REBOOT; the thresholds must differ.
 # Empty, zero, or a negative value disables ZeroTier escalation.
 TW_FAIL_START_ZT=4
+
+# Automatically stop ZeroTier after Tailscale recovers, but only when this
+# watchdog started the ZeroTier daemon. Requires conntrack; otherwise the
+# watchdog fails safe and leaves ZeroTier running. Disabled by default.
+TW_STOP_ZT_ON_RECOVERY=0
+# Minimum recovery grace period before idle checks begin (seconds).
+TW_ZT_RECOVERY_GRACE=600
+# Consecutive idle observations required before stopping ZeroTier.
+TW_ZT_IDLE_CHECKS=3
+# Minimum seconds between idle observations.
+TW_ZT_IDLE_INTERVAL=60
 
 # Gives Tailscale time to initialise after the watchdog starts
 TW_STARTUP_DELAY=60

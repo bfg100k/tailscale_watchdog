@@ -31,6 +31,10 @@ TW_PING_ALWAYS=""
 TW_ZT_NETWORK_ID=""
 TW_FAIL_REBOOT=""
 TW_FAIL_START_ZT=""
+TW_STOP_ZT_ON_RECOVERY=0
+TW_ZT_RECOVERY_GRACE=600
+TW_ZT_IDLE_CHECKS=3
+TW_ZT_IDLE_INTERVAL=60
 TW_STARTUP_DELAY=60
 TW_CHECK_INTERVAL=60
 TW_TAG_CACHE_INTERVAL=10
@@ -148,10 +152,26 @@ validate_config() {
         _die "TW_FAIL_START_ZT must be an optional signed integer (maximum 9 digits)."
     ZT_THRESHOLD=$NORMALIZED_THRESHOLD
 
-    if [ "$REBOOT_THRESHOLD" -gt 0 ] && [ "$ZT_THRESHOLD" -gt 0 ] &&
-       [ "$ZT_THRESHOLD" -le "$REBOOT_THRESHOLD" ]; then
-        _die "TW_FAIL_START_ZT must be greater than TW_FAIL_REBOOT when both are enabled."
-    fi
+    [ "$REBOOT_THRESHOLD" -ne "$ZT_THRESHOLD" ] ||
+        [ "$REBOOT_THRESHOLD" -le 0 ] ||
+        _die "TW_FAIL_REBOOT and TW_FAIL_START_ZT must not be equal when both are enabled."
+
+    case "$TW_STOP_ZT_ON_RECOVERY" in
+        0|1) ;;
+        *) _die "TW_STOP_ZT_ON_RECOVERY must be 0 or 1." ;;
+    esac
+    case "$TW_ZT_RECOVERY_GRACE" in
+        ''|*[!0-9]*) _die "TW_ZT_RECOVERY_GRACE must be a non-negative integer." ;;
+    esac
+    [ "${#TW_ZT_RECOVERY_GRACE}" -le 9 ] || _die "TW_ZT_RECOVERY_GRACE is too large."
+    case "$TW_ZT_IDLE_CHECKS" in
+        ''|*[!0-9]*|0) _die "TW_ZT_IDLE_CHECKS must be a positive integer." ;;
+    esac
+    [ "${#TW_ZT_IDLE_CHECKS}" -le 9 ] || _die "TW_ZT_IDLE_CHECKS is too large."
+    case "$TW_ZT_IDLE_INTERVAL" in
+        ''|*[!0-9]*|0) _die "TW_ZT_IDLE_INTERVAL must be a positive integer." ;;
+    esac
+    [ "${#TW_ZT_IDLE_INTERVAL}" -le 9 ] || _die "TW_ZT_IDLE_INTERVAL is too large."
 
     if [ "$ZT_THRESHOLD" -gt 0 ]; then
         if [ -z "$TW_ZT_NETWORK_ID" ]; then
@@ -229,6 +249,13 @@ init_environment() {
             _die "ZeroTier escalation is enabled, but zerotier-cli is unavailable."
     fi
 
+    CONNTRACK_BIN=
+    if [ "$TW_STOP_ZT_ON_RECOVERY" -eq 1 ] && [ "$ZT_THRESHOLD" -gt 0 ]; then
+        CONNTRACK_BIN=$(command -v conntrack 2>/dev/null || :)
+        [ -n "$CONNTRACK_BIN" ] ||
+            _warn "Automatic ZeroTier cleanup is enabled, but conntrack is unavailable. ZeroTier will not be stopped."
+    fi
+
     CURL_BIN=
     if [ -n "$TW_DISCORD_WEBHOOK" ]; then
         CURL_BIN=$(command -v curl 2>/dev/null || :)
@@ -283,6 +310,14 @@ init_environment() {
     WAN_FLAG_FILE="$VOLATILE_DIR/wan_restart_marker"
     STATUS_FILE="$VOLATILE_DIR/tailscale_status.json"
     PERSIST_MARKER="$PERSIST_DIR/reboot_marker"
+    ZT_ESCALATED_MARKER="$PERSIST_DIR/zerotier_escalated"
+    ZT_OWNED_MARKER="$PERSIST_DIR/zerotier_owned"
+    ZT_RESTORE_MARKER="$PERSIST_DIR/zerotier_restore"
+    ZT_RECOVERY_FILE="$VOLATILE_DIR/zerotier_recovery_time"
+    ZT_IDLE_COUNT_FILE="$VOLATILE_DIR/zerotier_idle_count"
+    ZT_LAST_CHECK_FILE="$VOLATILE_DIR/zerotier_last_check"
+    ZT_LAST_RX_FILE="$VOLATILE_DIR/zerotier_last_rx"
+    ZT_LAST_TX_FILE="$VOLATILE_DIR/zerotier_last_tx"
 
     # Cache is refreshed on the first check, then every configured interval.
     TAG_CACHE_AGE=$TW_TAG_CACHE_INTERVAL
@@ -309,6 +344,11 @@ print_config() {
 	    _info "Starting fallback ZeroTier service after $ZT_THRESHOLD consecutive failures."
 		_info "Configured ZeroTier network ID is $TW_ZT_NETWORK_ID."
 	fi
+    if [ "$TW_STOP_ZT_ON_RECOVERY" -eq 1 ]; then
+        _info "Automatic ZeroTier cleanup enabled (grace ${TW_ZT_RECOVERY_GRACE}s, ${TW_ZT_IDLE_CHECKS} idle checks ${TW_ZT_IDLE_INTERVAL}s apart)."
+        [ -n "$CONNTRACK_BIN" ] ||
+            _warn "conntrack unavailable; automatic ZeroTier cleanup will fail safe and leave the service running."
+    fi
     if [ -n "$TW_DISCORD_WEBHOOK" ]; then
         _info "Discord webhook set. Will send notification when remediation is attempted."
     fi
@@ -594,6 +634,20 @@ activate_zerotier() {
         return 1
     fi
 
+    # Only claim ownership when the daemon was not already running. A service
+    # that predates watchdog escalation may be in use for manual recovery.
+    if [ "${ZT_RESTORING:-0}" -eq 1 ]; then
+        ZT_NEEDS_OWNERSHIP=0
+    elif ! "$ZEROTIER_BIN" info >/dev/null 2>&1; then
+        mkdir -p "$PERSIST_DIR" || {
+            _err "Unable to create persistent state directory for ZeroTier ownership."
+            return 1
+        }
+        ZT_NEEDS_OWNERSHIP=1
+    else
+        ZT_NEEDS_OWNERSHIP=0
+    fi
+
     if is_zerotier_network_ok; then
         _info "ZeroTier network verified ONLINE (OK)."
         return 0
@@ -604,6 +658,11 @@ activate_zerotier() {
     if ! manage_zerotier start; then
         _err "Unable to start ZeroTier service."
         return 1
+    fi
+
+    if [ "$ZT_NEEDS_OWNERSHIP" -eq 1 ]; then
+        touch "$ZT_OWNED_MARKER" ||
+            _warn "Unable to record ZeroTier ownership; automatic cleanup will not be attempted."
     fi
 
     ZT_STATUS=$(get_zerotier_network_status)
@@ -630,6 +689,141 @@ activate_zerotier() {
     return 1
 }
 
+# Return success if conntrack contains a flow involving one of this node's
+# ZeroTier addresses. Requiring conntrack is intentional: absent/inconclusive
+# connection tracking must never be interpreted as an idle tunnel.
+zerotier_has_tracked_connections() {
+    [ -n "$CONNTRACK_BIN" ] || return 2
+
+    zt_network_line=$("$ZEROTIER_BIN" listnetworks 2>/dev/null |
+        awk -v nwid="$TW_ZT_NETWORK_ID" '$1 == "200" && $2 == "listnetworks" && $3 == nwid { print $0; found=1; exit } END { if (!found) exit 1 }') || return 2
+    zt_iface=$(printf '%s\n' "$zt_network_line" | awk '{print $8}')
+    [ -n "$zt_iface" ] && [ "$zt_iface" != "-" ] || return 2
+
+    zt_local_ips=$(ip -o addr show dev "$zt_iface" 2>/dev/null |
+        awk '{ split($4, a, "/"); if (a[1] != "") print a[1] }')
+    [ -n "$zt_local_ips" ] || return 2
+
+    zt_conntrack_output=$("$CONNTRACK_BIN" -L 2>/dev/null) || return 2
+    printf '%s\n' "$zt_conntrack_output" |
+        awk -v addresses="$zt_local_ips" '
+            BEGIN {
+                count = split(addresses, address, /[[:space:]]+/)
+                for (i = 1; i <= count; i++) wanted[address[i]] = 1
+            }
+            {
+                for (i = 1; i <= NF; i++) {
+                    token = $i
+                    sub(/^(src|dst)=/, "", token)
+                    if (token in wanted) found = 1
+                }
+            }
+            END { exit !found }
+        '
+}
+
+cleanup_zerotier() {
+    [ "$TW_STOP_ZT_ON_RECOVERY" -eq 1 ] || return 0
+    [ -f "$ZT_OWNED_MARKER" ] || return 0
+
+    if [ -z "$CONNTRACK_BIN" ]; then
+        _debug "Cannot safely inspect ZeroTier connections; leaving ZeroTier running."
+        return 0
+    fi
+
+    zt_now=$(date +%s) || return 0
+    case "$zt_now" in ''|*[!0-9]*) return 0 ;; esac
+
+    if [ ! -f "$ZT_RECOVERY_FILE" ]; then
+        printf '%s\n' "$zt_now" > "$ZT_RECOVERY_FILE" || return 0
+        rm -f "$ZT_IDLE_COUNT_FILE" "$ZT_LAST_CHECK_FILE" "$ZT_LAST_RX_FILE" "$ZT_LAST_TX_FILE"
+        _info "Tailscale recovered; ZeroTier cleanup grace period started."
+        return 0
+    fi
+
+    zt_recovery_time=$(cat "$ZT_RECOVERY_FILE" 2>/dev/null)
+    case "$zt_recovery_time" in ''|*[!0-9]*)
+        _warn "Invalid ZeroTier recovery timestamp; restarting cleanup grace period."
+        printf '%s\n' "$zt_now" > "$ZT_RECOVERY_FILE"
+        rm -f "$ZT_IDLE_COUNT_FILE" "$ZT_LAST_CHECK_FILE" "$ZT_LAST_RX_FILE" "$ZT_LAST_TX_FILE"
+        return 0
+        ;;
+    esac
+    [ "$((zt_now - zt_recovery_time))" -ge "$TW_ZT_RECOVERY_GRACE" ] || return 0
+
+    zt_network_line=$("$ZEROTIER_BIN" listnetworks 2>/dev/null |
+        awk -v nwid="$TW_ZT_NETWORK_ID" '$1 == "200" && $2 == "listnetworks" && $3 == nwid { print $0; found=1; exit } END { if (!found) exit 1 }') || {
+        _warn "Unable to determine ZeroTier interface; leaving service running."
+        return 0
+    }
+    zt_iface=$(printf '%s\n' "$zt_network_line" | awk '{print $8}')
+    [ -n "$zt_iface" ] && [ "$zt_iface" != "-" ] || {
+        _warn "ZeroTier interface is unavailable; leaving service running."
+        return 0
+    }
+
+    zt_rx_file="/sys/class/net/$zt_iface/statistics/rx_bytes"
+    zt_tx_file="/sys/class/net/$zt_iface/statistics/tx_bytes"
+    [ -r "$zt_rx_file" ] && [ -r "$zt_tx_file" ] || {
+        _warn "ZeroTier interface counters unavailable; leaving service running."
+        return 0
+    }
+    zt_rx=$(cat "$zt_rx_file" 2>/dev/null) || return 0
+    zt_tx=$(cat "$zt_tx_file" 2>/dev/null) || return 0
+    case "$zt_rx:$zt_tx" in *[!0-9:]*|:*) return 0 ;; esac
+
+    if zerotier_has_tracked_connections; then
+        _info "Tracked ZeroTier connection detected; postponing automatic stop."
+        echo 0 > "$ZT_IDLE_COUNT_FILE"
+        printf '%s\n' "$zt_rx" > "$ZT_LAST_RX_FILE"
+        printf '%s\n' "$zt_tx" > "$ZT_LAST_TX_FILE"
+        printf '%s\n' "$zt_now" > "$ZT_LAST_CHECK_FILE"
+        return 0
+    else
+        zt_conntrack_rc=$?
+        if [ "$zt_conntrack_rc" -ne 1 ]; then
+            _warn "Unable to establish ZeroTier connection state; leaving service running."
+            return 0
+        fi
+    fi
+
+    if [ -f "$ZT_LAST_CHECK_FILE" ]; then
+        zt_last_check=$(cat "$ZT_LAST_CHECK_FILE" 2>/dev/null)
+        case "$zt_last_check" in ''|*[!0-9]*) zt_last_check=0 ;; esac
+        [ "$((zt_now - zt_last_check))" -ge "$TW_ZT_IDLE_INTERVAL" ] || return 0
+    fi
+
+    zt_last_rx=$(cat "$ZT_LAST_RX_FILE" 2>/dev/null || :)
+    zt_last_tx=$(cat "$ZT_LAST_TX_FILE" 2>/dev/null || :)
+    if [ -n "$zt_last_rx" ] &&
+       { [ "$zt_rx" != "$zt_last_rx" ] || [ "$zt_tx" != "$zt_last_tx" ]; }; then
+        _info "ZeroTier traffic detected; restarting idle observation."
+        echo 0 > "$ZT_IDLE_COUNT_FILE"
+    else
+        zt_idle_count=$(cat "$ZT_IDLE_COUNT_FILE" 2>/dev/null || echo 0)
+        case "$zt_idle_count" in ''|*[!0-9]*) zt_idle_count=0 ;; esac
+        zt_idle_count=$((zt_idle_count + 1))
+        printf '%s\n' "$zt_idle_count" > "$ZT_IDLE_COUNT_FILE"
+        _debug "ZeroTier idle observation $zt_idle_count/$TW_ZT_IDLE_CHECKS."
+    fi
+    printf '%s\n' "$zt_rx" > "$ZT_LAST_RX_FILE"
+    printf '%s\n' "$zt_tx" > "$ZT_LAST_TX_FILE"
+    printf '%s\n' "$zt_now" > "$ZT_LAST_CHECK_FILE"
+
+    zt_idle_count=$(cat "$ZT_IDLE_COUNT_FILE" 2>/dev/null || echo 0)
+    [ "$zt_idle_count" -ge "$TW_ZT_IDLE_CHECKS" ] || return 0
+
+    _warn "ZeroTier has remained idle with no tracked connections; stopping watchdog-started service."
+    if manage_zerotier stop; then
+        rm -f "$ZT_OWNED_MARKER" "$ZT_RESTORE_MARKER" "$ZT_RECOVERY_FILE" \
+            "$ZT_IDLE_COUNT_FILE" "$ZT_LAST_CHECK_FILE" "$ZT_LAST_RX_FILE" "$ZT_LAST_TX_FILE"
+        _info "ZeroTier stopped and watchdog ownership released."
+    else
+        _err "Unable to stop ZeroTier; ownership retained for a later retry."
+        echo 0 > "$ZT_IDLE_COUNT_FILE"
+    fi
+    return 0
+}
 
 # --- FAILURE COUNTER ---
 
@@ -658,8 +852,8 @@ save_fail_count() {
 
 reset_fail_count() {
     FAIL_COUNT=0
-    rm -f "$COUNTER_FILE" "$PERSIST_MARKER"
-    _info "Tailscale recovered. Failure counter and reboot marker cleared."
+    rm -f "$COUNTER_FILE" "$PERSIST_MARKER" "$ZT_ESCALATED_MARKER" "$ZT_RESTORE_MARKER"
+    _info "Tailscale recovered. Failure counter and escalation markers cleared."
 }
 
 
@@ -717,17 +911,11 @@ remediate_failure() {
 
     _warn "Consecutive Tailscale failures: $FAIL_COUNT"
 
-    # Once ZeroTier escalation has been reached, do not repeat activation or
-    # take any further remediation action until Tailscale recovers.
-    if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ]; then
-        _warn "Tailscale remains unhealthy after ZeroTier escalation. No further remediation will be attempted."
-        return 0
-    fi
-
-    # Start ZeroTier exactly at its configured threshold. This is checked
-    # before reboot only because validation requires ZT_THRESHOLD > REBOOT_THRESHOLD.
+    # Trigger each escalation independently; either threshold may come first.
     if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -eq "$ZT_THRESHOLD" ]; then
         _warn "Escalation: Activating ZeroTier fallback."
+        mkdir -p "$PERSIST_DIR" || _die "Unable to create persistent directory."
+        touch "$ZT_ESCALATED_MARKER" || _die "Unable to write ZeroTier escalation marker."
         discord_notify "Tailscale watchdog: activating ZeroTier fallback after $FAIL_COUNT consecutive failed checks."
         activate_zerotier
         return $?
@@ -745,9 +933,24 @@ remediate_failure() {
         printf '%s\n' "$REBOOT_THRESHOLD" > "$PERSIST_MARKER" ||
             _die "Unable to write reboot marker."
 
+        # Restore the escalated ZeroTier network after reboot without
+        # enabling the service permanently at boot.
+        if [ -f "$ZT_ESCALATED_MARKER" ]; then
+            touch "$ZT_RESTORE_MARKER" || _die "Unable to write ZeroTier restoration marker."
+        fi
+
         sync
         reboot
         return $?
+    fi
+
+    # Once ZeroTier has been activated, hold position until a later reboot
+    # threshold (if any). If reboot was earlier, keep restarting Tailscale
+    # until the later ZeroTier threshold is reached.
+    if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ] &&
+       { [ "$REBOOT_THRESHOLD" -le 0 ] || [ "$FAIL_COUNT" -lt "$REBOOT_THRESHOLD" ]; }; then
+        _warn "ZeroTier escalation already active; waiting for recovery or a later reboot threshold."
+        return 0
     fi
 
     # Before escalation thresholds (and indefinitely when both are disabled),
@@ -768,6 +971,16 @@ remediate_failure() {
 
 main() {
     _debug "Executing Tailscale watchdog checks..."
+
+    # A watchdog-triggered reboot may have interrupted ZeroTier. Retry
+    # restoration until its configured network reaches OK.
+    if [ -f "$ZT_RESTORE_MARKER" ]; then
+        ZT_RESTORING=1
+        activate_zerotier
+        zt_restore_status=$?
+        ZT_RESTORING=0
+        [ "$zt_restore_status" -eq 0 ] && rm -f "$ZT_RESTORE_MARKER"
+    fi
 
     TS_FAILED=0
 
@@ -808,9 +1021,11 @@ main() {
     # SUCCESS: Tailscale is healthy.
     if [ "$TS_FAILED" -eq 0 ]; then
         if [ "$FAIL_COUNT" -gt 0 ] ||
-            [ -f "$COUNTER_FILE" ] || [ -f "$PERSIST_MARKER" ]; then
+            [ -f "$COUNTER_FILE" ] || [ -f "$PERSIST_MARKER" ] ||
+            [ -f "$ZT_ESCALATED_MARKER" ] || [ -f "$ZT_RESTORE_MARKER" ]; then
             reset_fail_count
         fi
+        cleanup_zerotier
 
         if [ -f "$WAN_FLAG_FILE" ]; then
             _info "WAN connectivity restored."
