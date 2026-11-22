@@ -213,6 +213,7 @@ init_environment() {
         PERSIST_DIR="/usr/lib/ts_watchdog"
         TAILSCALE_SERVICE_FN=manage_tailscale_openwrt
         ZEROTIER_SERVICE_FN=manage_zerotier_openwrt
+        ZEROTIER_ACTIVE_CHECK_FN=zerotier_service_active_openwrt
         NETWORK_RESTART_FN=restart_network_openwrt
         if command -v jsonfilter >/dev/null 2>&1; then
             TAG_IP_PARSER_FN=get_tag_peer_ips_jsonfilter
@@ -223,6 +224,7 @@ init_environment() {
         PERSIST_DIR="/var/lib/ts_watchdog"
         TAILSCALE_SERVICE_FN=manage_tailscale_systemd
         ZEROTIER_SERVICE_FN=manage_zerotier_systemd
+        ZEROTIER_ACTIVE_CHECK_FN=zerotier_service_active_systemd
         if command -v systemctl >/dev/null 2>&1; then
             NETWORK_RESTART_FN=restart_network_systemctl
         elif command -v ifdown >/dev/null 2>&1 &&
@@ -271,6 +273,14 @@ init_environment() {
         INTERFACE_CHECK_FN=has_tailscale_interface_ifconfig
     else
         _die "Neither ip nor ifconfig is available."
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        ZT_INTERFACE_IP_FN=get_interface_ips_ip
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ZT_INTERFACE_IP_FN=get_interface_ips_ifconfig
+    else
+        ZT_INTERFACE_IP_FN=
     fi
 
     # Normalise this option once; the main check loop only needs a boolean.
@@ -381,6 +391,32 @@ manage_zerotier() {
     "$ZEROTIER_SERVICE_FN" "$1"
 }
 
+zerotier_service_active_systemd() {
+    zt_state=$(systemctl show -p ActiveState --value zerotier-one 2>/dev/null) ||
+        return 2
+
+    case "$zt_state" in
+        active|activating|reloading)
+            return 0
+            ;;
+        inactive)
+            return 1
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
+zerotier_service_active_openwrt() {
+    command -v pidof >/dev/null 2>&1 || return 2
+
+    if pidof zerotier-one >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
 
 # --- NETWORK HELPERS ---
 
@@ -430,6 +466,26 @@ restart_network() {
     "$NETWORK_RESTART_FN"
 }
 
+get_interface_ips_ip() {
+    ip -o addr show dev "$1" 2>/dev/null |
+        awk '{ split($4, a, "/"); if (a[1] != "") print a[1] }'
+}
+
+get_interface_ips_ifconfig() {
+    ifconfig "$1" 2>/dev/null |
+        awk '
+            /inet addr:/ {
+                split($2, a, ":")
+                if (a[2] != "") print a[2]
+            }
+            /inet6 addr:/ {
+                if ($3 != "") print $3
+            }
+            /^[[:space:]]*inet / {
+                if ($2 != "") print $2
+            }
+        '
+}
 
 # --- TAILSCALE JSON HELPERS ---
 
@@ -634,18 +690,30 @@ activate_zerotier() {
         return 1
     fi
 
-    # Only claim ownership when the daemon was not already running. A service
-    # that predates watchdog escalation may be in use for manual recovery.
+    # Only claim ownership when the service manager confirms that the
+    # daemon was stopped before escalation. Unknown state is fail-safe.
     if [ "${ZT_RESTORING:-0}" -eq 1 ]; then
         ZT_NEEDS_OWNERSHIP=0
-    elif ! "$ZEROTIER_BIN" info >/dev/null 2>&1; then
-        mkdir -p "$PERSIST_DIR" || {
-            _err "Unable to create persistent state directory for ZeroTier ownership."
-            return 1
-        }
-        ZT_NEEDS_OWNERSHIP=1
     else
-        ZT_NEEDS_OWNERSHIP=0
+        "$ZEROTIER_ACTIVE_CHECK_FN"
+        zt_service_rc=$?
+
+        case "$zt_service_rc" in
+            0)
+                ZT_NEEDS_OWNERSHIP=0
+                ;;
+            1)
+                ZT_NEEDS_OWNERSHIP=1
+                mkdir -p "$PERSIST_DIR" || {
+                    _err "Unable to create persistent state directory for ZeroTier ownership."
+                    return 1
+                }
+                ;;
+            *)
+                ZT_NEEDS_OWNERSHIP=0
+                _warn "Unable to determine whether ZeroTier was already running; automatic cleanup ownership will not be claimed."
+                ;;
+        esac
     fi
 
     if is_zerotier_network_ok; then
@@ -700,8 +768,8 @@ zerotier_has_tracked_connections() {
     zt_iface=$(printf '%s\n' "$zt_network_line" | awk '{print $8}')
     [ -n "$zt_iface" ] && [ "$zt_iface" != "-" ] || return 2
 
-    zt_local_ips=$(ip -o addr show dev "$zt_iface" 2>/dev/null |
-        awk '{ split($4, a, "/"); if (a[1] != "") print a[1] }')
+    [ -n "$ZT_INTERFACE_IP_FN" ] || return 2
+    zt_local_ips=$("$ZT_INTERFACE_IP_FN" "$zt_iface")
     [ -n "$zt_local_ips" ] || return 2
 
     zt_conntrack_output=$("$CONNTRACK_BIN" -L 2>/dev/null) || return 2
@@ -941,6 +1009,19 @@ remediate_failure() {
 
         sync
         reboot
+        return $?
+    fi
+
+    # Retry ZeroTier activation if the initial attempt did not bring the
+    # configured network online. The reboot threshold takes precedence.
+    if [ "$ZT_THRESHOLD" -gt 0 ] &&
+       [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ] &&
+       [ -f "$ZT_ESCALATED_MARKER" ] &&
+       { [ "$REBOOT_THRESHOLD" -le 0 ] ||
+         [ "$FAIL_COUNT" -lt "$REBOOT_THRESHOLD" ]; } &&
+       ! is_zerotier_network_ok; then
+        _warn "ZeroTier network is not yet online; retrying activation."
+        activate_zerotier
         return $?
     fi
 
