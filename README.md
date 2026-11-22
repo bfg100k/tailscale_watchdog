@@ -1,14 +1,16 @@
 # tailscale_watchdog
 Simple service / script to monitor health of the Tailscale service and attempt recovery if found to be unhealthy.
 
-Health status is determined by checking the output of the `tailscale status` command. Optionally, it will ping a remote tailscale node if configured.
+Health status is primarily determined by checking the output of the `tailscale status` command. For a more thorough check, specify one or more remote Tailscale targets. The watchdog will test connectivity to these targets whenever Tailscale reports no active connections, or you can configure it to run this test on every check.
 
 Three types of recovery methods are included [(see failure escalation for more details)](#failure-escalation):
 - Restart tailscale service
 - Reboot machine
 - Start ZeroTier service (as backup tunnel for manual recovery. Useful in situations where the node can only be accessed remotely)
 
-Note that the watchdog ignores WAN failures and will attempt network stack recovery ***once*** per WAN outage.
+### Notes 
+- The watchdog ignores WAN failures (i.e. not treated as a tailscale service failure) and will attempt network stack recovery ***once*** per WAN outage.
+- The watchdog will not attempt to stop the ZeroTier service on recovery. This is to avoid accidentally killing any active connections.
 
 ## Files
 - `tailscale_watchdog`: foreground POSIX sh watchdog. Default mode is `--loop`; `--once` available for manual testing.
