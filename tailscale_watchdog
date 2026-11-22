@@ -496,23 +496,8 @@ get_tailscale_status() {
 
 # OpenWrt parser.
 get_tag_peer_ips_jsonfilter() {
-    tag=$1
-
-    jsonfilter -i "$STATUS_FILE" -e '@.Peer.*' |
-        while IFS= read -r peer; do
-            [ -n "$peer" ] || continue
-
-            online=$(printf '%s\n' "$peer" |
-                jsonfilter -e '@.Online' 2>/dev/null)
-            [ "$online" = "true" ] || continue
-
-            printf '%s\n' "$peer" |
-                jsonfilter -e '@.Tags[*]' 2>/dev/null |
-                grep -F -x "$tag" >/dev/null 2>&1 || continue
-
-            printf '%s\n' "$peer" |
-                jsonfilter -e '@.TailscaleIPs[*]' 2>/dev/null
-        done
+    jsonfilter -i "$STATUS_FILE" \
+        -e '@.Peer[*][@.Online=true && @.Tags[*]="'"$1"'"].TailscaleIPs[*]' 2>/dev/null
 }
 
 # Debian parser.
