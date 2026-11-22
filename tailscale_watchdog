@@ -269,18 +269,12 @@ init_environment() {
     # availability on every watchdog iteration.
     if command -v ip >/dev/null 2>&1; then
         INTERFACE_CHECK_FN=has_tailscale_interface_ip
-    elif command -v ifconfig >/dev/null 2>&1; then
-        INTERFACE_CHECK_FN=has_tailscale_interface_ifconfig
-    else
-        _die "Neither ip nor ifconfig is available."
-    fi
-
-    if command -v ip >/dev/null 2>&1; then
         ZT_INTERFACE_IP_FN=get_interface_ips_ip
     elif command -v ifconfig >/dev/null 2>&1; then
+        INTERFACE_CHECK_FN=has_tailscale_interface_ifconfig
         ZT_INTERFACE_IP_FN=get_interface_ips_ifconfig
     else
-        ZT_INTERFACE_IP_FN=
+        _die "Neither ip nor ifconfig is available."
     fi
 
     # Normalise this option once; the main check loop only needs a boolean.
@@ -823,8 +817,8 @@ cleanup_zerotier() {
         _warn "ZeroTier interface counters unavailable; leaving service running."
         return 0
     }
-    zt_rx=$(cat "$zt_rx_file" 2>/dev/null) || return 0
-    zt_tx=$(cat "$zt_tx_file" 2>/dev/null) || return 0
+    read -r zt_rx < "$zt_rx_file" 2>/dev/null || return 0
+    read -r zt_tx < "$zt_tx_file" 2>/dev/null || return 0
     case "$zt_rx:$zt_tx" in *[!0-9:]*|:*) return 0 ;; esac
 
     if zerotier_has_tracked_connections "$zt_iface"; then
