@@ -322,6 +322,115 @@ init_environment() {
     PING_TARGET_CACHE=
 }
 
+
+append_escalation_step() {
+    local strategy=$1
+    local step=$2
+
+    if [ -n "$strategy" ]; then
+        printf '%s -> %s' "$strategy" "$step"
+    else
+        printf '%s' "$step"
+    fi
+}
+
+append_restart_range() {
+    local strategy=$1
+    local range_start=$2
+    local range_end=$3
+
+    [ "$range_start" -le "$range_end" ] || {
+        printf '%s' "$strategy"
+        return 0
+    }
+
+    if [ "$range_start" -eq "$range_end" ]; then
+        strategy=$(append_escalation_step "$strategy" \
+            "restart Tailscale daemon ($range_start)")
+    else
+        strategy=$(append_escalation_step "$strategy" \
+            "restart Tailscale daemon ($range_start-$range_end)")
+    fi
+
+    printf '%s' "$strategy"
+}
+
+print_escalation_strategy() {
+    local escalation_strategy=
+
+    if [ "$REBOOT_THRESHOLD" -gt 0 ] &&
+       [ "$ZT_THRESHOLD" -gt 0 ]; then
+
+        if [ "$REBOOT_THRESHOLD" -lt "$ZT_THRESHOLD" ]; then
+            # Reboot occurs first; Tailscale restarts continue afterwards
+            # until ZeroTier is activated.
+            escalation_strategy=$(append_restart_range \
+                "$escalation_strategy" 1 "$((REBOOT_THRESHOLD - 1))")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" "reboot system ($REBOOT_THRESHOLD)")
+
+            escalation_strategy=$(append_restart_range \
+                "$escalation_strategy" \
+                "$((REBOOT_THRESHOLD + 1))" "$((ZT_THRESHOLD - 1))")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" "activate ZeroTier fallback ($ZT_THRESHOLD)")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" \
+                "ensure ZeroTier remains online; no further Tailscale restarts")
+
+        else
+            # ZeroTier activates first; reboot may still occur later.
+            escalation_strategy=$(append_restart_range \
+                "$escalation_strategy" 1 "$((ZT_THRESHOLD - 1))")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" "activate ZeroTier fallback ($ZT_THRESHOLD)")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" "ensure ZeroTier remains online")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" "reboot system ($REBOOT_THRESHOLD)")
+
+            escalation_strategy=$(append_escalation_step \
+                "$escalation_strategy" \
+                "continue ensuring ZeroTier remains online; no Tailscale restarts")
+        fi
+
+    elif [ "$REBOOT_THRESHOLD" -gt 0 ]; then
+        escalation_strategy=$(append_restart_range \
+            "$escalation_strategy" 1 "$((REBOOT_THRESHOLD - 1))")
+
+        escalation_strategy=$(append_escalation_step \
+            "$escalation_strategy" "reboot system ($REBOOT_THRESHOLD)")
+
+        escalation_strategy=$(append_escalation_step \
+            "$escalation_strategy" \
+            "restart Tailscale daemon on every subsequent failure")
+
+    elif [ "$ZT_THRESHOLD" -gt 0 ]; then
+        escalation_strategy=$(append_restart_range \
+            "$escalation_strategy" 1 "$((ZT_THRESHOLD - 1))")
+
+        escalation_strategy=$(append_escalation_step \
+            "$escalation_strategy" "activate ZeroTier fallback ($ZT_THRESHOLD)")
+
+        escalation_strategy=$(append_escalation_step \
+            "$escalation_strategy" \
+            "ensure ZeroTier remains online; no further Tailscale restarts")
+
+    else
+        escalation_strategy=$(append_escalation_step \
+            "$escalation_strategy" \
+            "restart Tailscale daemon on every failed check")
+    fi
+
+    _info "Failure escalation strategy - $escalation_strategy"
+}
+
 print_config() {
     _info "Performing health check every $TW_CHECK_INTERVAL seconds."
     if [ "$HAS_PING_TARGETS" -eq 1 ]; then
@@ -335,11 +444,8 @@ print_config() {
     else
         _info "Health check type - local tailscaled status"
     fi
-    if [ "$REBOOT_THRESHOLD" -gt 0 ]; then
-        _info "Rebooting system after $REBOOT_THRESHOLD consecutive failures."
-    fi
+	print_escalation_strategy
 	if [ "$ZT_THRESHOLD" -gt 0 ]; then
-	    _info "Starting fallback ZeroTier service after $ZT_THRESHOLD consecutive failures."
 		_info "Configured ZeroTier network ID is $TW_ZT_NETWORK_ID."
 	fi
     if [ "$TW_STOP_ZT_ON_RECOVERY" -eq 1 ]; then
