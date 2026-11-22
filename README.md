@@ -68,7 +68,7 @@ escalation values.
 | `TW_ZT_IDLE_INTERVAL` | `60` | Minimum seconds between idle observations. |
 | `TW_STARTUP_DELAY` | `60` | Seconds to wait before starting the first health check. This is required to allow tailscale time to startup completely when this service is configured to start on system bootup. |
 | `TW_CHECK_INTERVAL` | `60` | Seconds to wait after each completed check. The check-start interval is this value plus the time spent checking/remediating. |
-| `TW_TAG_CACHE_INTERVAL` | `10` | Number of checks between ACL-tag peer cache refreshes. The first refresh occurs on startup. Cached IPs are pinged on every check. |
+| `TW_TAG_CACHE_INTERVAL` | `10` | Number of checks between ACL-tag peer cache refreshes. The first refresh occurs on first connectivity check. |
 | `TW_DISCORD_WEBHOOK` | empty | Optional Discord webhook URL. A best-effort notification is sent immediately before each remediation action. Notification failures do not block remediation. |
 | `LOG` | `2` | Log level: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR. |
 
