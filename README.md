@@ -72,32 +72,104 @@ escalation values.
 | `TW_DISCORD_WEBHOOK` | empty | Optional Discord webhook URL. A best-effort notification is sent immediately before each remediation action. Notification failures do not block remediation. |
 | `LOG` | `3` | Log level: 1 = DEBUG, 2 = INFO, 3 = WARN, 4 = ERROR. |
 
+
 ### Failure escalation
 
-- Before an enabled threshold is reached, every failed check restarts Tailscale.
-- At `TW_FAIL_REBOOT`, the watchdog sends a notification (if configured), writes
-a persistent marker, and attempts one reboot. The marker prevents another reboot
-following startup. If Tailscale remains unhealthy after reboot, subsequent failed
-checks restart Tailscale rather than rebooting again.
-- At `TW_FAIL_START_ZT`, the watchdog sends a notification and attempts to activate
-  ZeroTier. Either escalation threshold may come first; equal positive thresholds
-  are rejected. After ZeroTier escalation, the watchdog waits for recovery or a
-  later configured reboot threshold. If reboot follows ZeroTier escalation, a
-  persistent marker causes ZeroTier to be restored after watchdog startup without
-  enabling its service permanently at boot. Tailscale recovery clears the
-  escalation/restoration markers.
-- Optional automatic cleanup waits for the configured recovery grace period, then
-  requires no conntrack entries involving the node's ZeroTier addresses and no
-  interface-counter changes across the configured consecutive idle observations.
-  It never stops a daemon that was already running before watchdog activation.
-- If both thresholds are disabled, Tailscale is restarted on every failed check.
-- If only ZeroTier escalation is enabled, Tailscale is restarted until the
-ZeroTier threshold is reached.
-- If only reboot escalation is enabled, Tailscale is restarted until the reboot
-threshold, rebooted once, and restarted on subsequent failed checks.
+The watchdog supports two independent escalation thresholds:
 
-Discord notifications are optional and require `curl`. The watchdog continues
-its remediation even if the webhook request fails.
+- `TW_FAIL_REBOOT`: reboot the machine after a configured number of
+  consecutive Tailscale failures.
+- `TW_FAIL_START_ZT`: activate the configured ZeroTier network after a
+  configured number of consecutive Tailscale failures.
+
+Both thresholds are optional. An empty, zero, or negative value disables
+the corresponding escalation. If both are enabled, either threshold may
+come first, but equal positive thresholds are rejected.
+
+Before ZeroTier has been activated, every failed check restarts the
+Tailscale daemon, except when a reboot is triggered at its configured
+threshold.
+
+#### Reboot escalation
+
+When `TW_FAIL_REBOOT` is reached, the watchdog:
+
+1. Sends a notification, if configured.
+2. Writes a persistent marker to prevent another reboot at the same
+   threshold.
+3. Attempts to reboot the machine.
+
+If Tailscale remains unhealthy after reboot, the watchdog resumes
+restarting the Tailscale daemon on subsequent failed checks. The failure
+counter is restored from the persistent marker so escalation continues
+from the previous count rather than starting again from zero.
+
+#### ZeroTier escalation
+
+When `TW_FAIL_START_ZT` is reached, the watchdog:
+
+1. Sends a notification, if configured.
+2. Records that ZeroTier fallback has been activated.
+3. Attempts to activate the configured ZeroTier network.
+
+Once ZeroTier escalation has occurred, the watchdog **stops attempting
+to restart Tailscale** for the remainder of the failure episode.
+
+On subsequent failed checks:
+
+- If the ZeroTier network is online, no further remediation is performed.
+- If the ZeroTier network is offline, the watchdog retries ZeroTier
+  activation.
+- Tailscale is not restarted, regardless of whether ZeroTier activation
+  succeeds.
+
+This fallback state is persistent across reboots. If a reboot threshold
+is configured and has not yet been reached, the watchdog can still reboot
+at that threshold. After reboot, it restores the previously activated
+ZeroTier network and continues in fallback mode without restarting
+Tailscale.
+
+#### Combining both thresholds
+
+The order of the two thresholds determines how the watchdog escalates:
+
+**Reboot before ZeroTier**
+
+If the reboot threshold is reached first, the machine reboots. After
+startup, Tailscale restarts continue on subsequent failed checks until
+the ZeroTier threshold is reached. Once ZeroTier is activated, Tailscale
+restarts stop permanently for that failure episode.
+
+**ZeroTier before reboot**
+
+If the ZeroTier threshold is reached first, the watchdog switches to
+ZeroTier fallback mode immediately. It continues checking that the
+ZeroTier network is online and can still reboot when the later reboot
+threshold is reached. After reboot, it remains in ZeroTier fallback
+mode and does not resume Tailscale restarts.
+
+#### Example escalation sequences
+
+| Configuration | Escalation sequence |
+|---|---|
+| Neither enabled | Restart Tailscale on every failed check |
+| Reboot = 4 | Restart Tailscale (1–3) → reboot (4) → restart Tailscale on subsequent failures |
+| ZeroTier = 4 | Restart Tailscale (1–3) → activate ZeroTier (4) → maintain ZeroTier fallback |
+| Reboot = 4, ZeroTier = 6 | Restart Tailscale (1–3) → reboot (4) → restart Tailscale (5) → activate ZeroTier (6) → maintain ZeroTier fallback |
+| ZeroTier = 4, Reboot = 6 | Restart Tailscale (1–3) → activate ZeroTier (4) → maintain ZeroTier fallback → reboot (6) → continue ZeroTier fallback |
+
+#### Recovery and ZeroTier cleanup
+
+When Tailscale recovers, the watchdog clears the failure escalation and
+restoration markers.
+
+ZeroTier cleanup is optional and disabled by default
+(`TW_STOP_ZT_ON_RECOVERY=0`). When enabled, the watchdog only considers
+stopping the ZeroTier daemon if it started that daemon itself. Cleanup
+is delayed by the configured recovery grace period and requires repeated
+checks to confirm that there are no active connections or interface
+traffic. If `conntrack` is unavailable or connection detection is
+inconclusive, ZeroTier is left running.
 
 ## Troubleshooting
 
