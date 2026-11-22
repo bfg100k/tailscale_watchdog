@@ -956,7 +956,7 @@ remediate_failure() {
 
     _warn "Consecutive Tailscale failures: $FAIL_COUNT"
 
-    # Trigger each escalation independently; either threshold may come first.
+    # Trigger ZeroTier activation at its configured threshold.
     if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -eq "$ZT_THRESHOLD" ]; then
         _warn "Escalation: Activating ZeroTier fallback."
         mkdir -p "$PERSIST_DIR" || _die "Unable to create persistent directory."
@@ -989,29 +989,20 @@ remediate_failure() {
         return $?
     fi
 
-    # Retry ZeroTier activation if the initial attempt did not bring the
-    # configured network online. The reboot threshold takes precedence.
-    if [ "$ZT_THRESHOLD" -gt 0 ] &&
-       [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ] &&
-       [ -f "$ZT_ESCALATED_MARKER" ] &&
-       { [ "$REBOOT_THRESHOLD" -le 0 ] ||
-         [ "$FAIL_COUNT" -lt "$REBOOT_THRESHOLD" ]; } &&
-       ! is_zerotier_network_ok; then
-        _warn "ZeroTier network is not yet online; retrying activation."
-        activate_zerotier
-        return $?
-    fi
+    # Once ZeroTier has been activated, never restart Tailscale again
+    # during this failure episode. Only ensure the ZeroTier network is online.
+    if [ "$ZT_THRESHOLD" -gt 0 ] && [ -f "$ZT_ESCALATED_MARKER" ]; then
+        if ! is_zerotier_network_ok; then
+            _warn "ZeroTier network is not yet online; retrying activation."
+            activate_zerotier
+            return $?
+        fi
 
-    # Once ZeroTier has been activated, hold position until a later reboot
-    # threshold (if any). If reboot was earlier, keep restarting Tailscale
-    # until the later ZeroTier threshold is reached.
-    if [ "$ZT_THRESHOLD" -gt 0 ] && [ "$FAIL_COUNT" -gt "$ZT_THRESHOLD" ] &&
-       { [ "$REBOOT_THRESHOLD" -le 0 ] || [ "$FAIL_COUNT" -lt "$REBOOT_THRESHOLD" ]; }; then
-        _warn "ZeroTier escalation already active; waiting for recovery or a later reboot threshold."
+        _warn "ZeroTier fallback is active; skipping Tailscale restart."
         return 0
     fi
 
-    # Before escalation thresholds (and indefinitely when both are disabled),
+    # Before ZeroTier escalation (and indefinitely when ZeroTier is disabled),
     # restart Tailscale on every failed check.
     _warn "Restarting Tailscale daemon."
     discord_notify "Tailscale watchdog: restarting tailscaled after $FAIL_COUNT consecutive failed checks."
@@ -1023,7 +1014,6 @@ remediate_failure() {
 
     return 0
 }
-
 
 # --- MAIN WATCHDOG LOGIC ---
 
